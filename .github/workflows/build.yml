@@ -1,4 +1,4 @@
-name: Build DSRE EXE
+name: Build DSRE (Private)
 
 on:
   workflow_dispatch:
@@ -21,19 +21,29 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: EXE作成
+      - name: EXE作成（_internal付き）
         run: |
-          pyinstaller --noconsole --onefile --add-data "ffmpeg;ffmpeg" main.py
+          pyinstaller DSRE.py ^
+            --noconsole ^
+            --name DSRE ^
+            --icon=logo.ico ^
+            --add-data "logo.ico;." ^
+            --collect-all librosa ^
+            --collect-all resampy ^
+            --collect-all soundfile ^
+            --collect-all scipy ^
+            --collect-all numpy ^
+            --collect-all PySide6
 
-      - name: zip化
+      - name: zip作成（元と同じ構成）
         run: |
-          mkdir output
-          copy dist\main.exe output\DSRE.exe
-          xcopy ffmpeg output\ffmpeg /E /I
-          powershell Compress-Archive -Path output\* -DestinationPath DSRE_build.zip
+          mkdir release
+          copy dist\DSRE.exe release\DSRE.exe
+          xcopy dist\DSRE release\_internal /E /I
+          powershell Compress-Archive -Path release\* -DestinationPath DSRE_custom.zip
 
       - name: 成果物保存
         uses: actions/upload-artifact@v4
         with:
-          name: DSRE_build
-          path: DSRE_build.zip
+          name: DSRE_custom
+          path: DSRE_custom.zip
