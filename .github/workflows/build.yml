@@ -1,0 +1,39 @@
+name: Build DSRE EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: コード取得
+        uses: actions/checkout@v4
+
+      - name: Python準備
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 依存インストール
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: EXE作成
+        run: |
+          pyinstaller --noconsole --onefile --add-data "ffmpeg;ffmpeg" main.py
+
+      - name: zip化
+        run: |
+          mkdir output
+          copy dist\main.exe output\DSRE.exe
+          xcopy ffmpeg output\ffmpeg /E /I
+          powershell Compress-Archive -Path output\* -DestinationPath DSRE_build.zip
+
+      - name: 成果物保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSRE_build
+          path: DSRE_build.zip
