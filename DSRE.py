@@ -1,9 +1,9 @@
-# ===== 安定最終版（処理保証＋ポップアップ完全抑止＋進捗正常）=====
+# ===== 完全安定修正版（動作保証＋原因可視化）=====
 
 import os
 import sys
-import traceback
 import time
+import traceback
 
 import subprocess
 import soundfile as sf
@@ -26,24 +26,23 @@ PARAMS = dict(
     post_hp=16000,
     target_sr=96000,
     filter_order=11,
-    format="FLAC"
 )
 
-# ===== ffmpeg完全非表示 =====
+# ===== ffmpeg（完全非表示＋失敗検出）=====
 def run_hidden(cmd):
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 0
 
-    return subprocess.run(
+    result = subprocess.run(
         cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         startupinfo=si,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        check=True
+        creationflags=subprocess.CREATE_NO_WINDOW
     )
+
+    if result.returncode != 0:
+        raise RuntimeError("ffmpeg失敗:\n" + result.stderr.decode(errors="ignore"))
 
 # ===== 安全読み込み =====
 def load_audio_safe(path):
@@ -56,7 +55,7 @@ def load_audio_safe(path):
             y = y[np.newaxis, :]
         return y, sr
 
-# ===== 保存（ポップアップ完全防止）=====
+# ===== 保存 =====
 def save_wav24_out(in_path, y_out, sr, out_path):
 
     if y_out.ndim == 1:
@@ -78,8 +77,7 @@ def save_wav24_out(in_path, y_out, sr, out_path):
 
     cmd = [
         "ffmpeg", "-y",
-        "-loglevel", "quiet",
-        "-nostdin",
+        "-loglevel", "error",
         "-i", tmp.name,
         "-i", in_path,
         "-map", "0:a",
@@ -90,11 +88,9 @@ def save_wav24_out(in_path, y_out, sr, out_path):
     ]
 
     run_hidden(cmd)
-
     os.remove(tmp.name)
-    return out_path
 
-# ===== DSP（絶対変更しない安定構成）=====
+# ===== DSP（変更なし）=====
 def freq_shift_mono(x, f_shift, d_sr):
     N = len(x)
     Np = 1 << int(np.ceil(np.log2(max(1, N))))
@@ -125,13 +121,13 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     for i in range(total):
 
         if abort_cb and abort_cb():
-            return x
+            return x  # ← 安全終了
 
         shift = sr * (i + 1) / (total * 2.0)
         d_res += f_dn(d_src, shift, d_sr) * np.exp(-(i + 1) * PARAMS["decay"])
 
         if progress_cb:
-            progress_cb(int((i + 1) * 100 / total))
+            progress_cb(i + 1, total)
 
     b, a = safe_butter(PARAMS["filter_order"], PARAMS["post_hp"], sr)
     d_res = signal.filtfilt(b, a, d_res)
@@ -180,8 +176,8 @@ class Worker(QtCore.QThread):
                     y = resampy.resample(y, sr, PARAMS["target_sr"])
                     sr = PARAMS["target_sr"]
 
-                def step_cb(p):
-                    self.sig_step.emit(p)
+                def step_cb(cur, m):
+                    self.sig_step.emit(int(cur * 100 / m))
 
                 y_out = zansei_impl(
                     y, sr,
@@ -192,7 +188,8 @@ class Worker(QtCore.QThread):
                 out = os.path.join(OUTPUT_DIR, os.path.basename(path))
                 save_wav24_out(path, y_out, sr, out)
 
-            except Exception:
+            except Exception as e:
+                self.sig_text.emit("エラー:\n" + str(e))
                 continue
 
             elapsed = time.time() - start
