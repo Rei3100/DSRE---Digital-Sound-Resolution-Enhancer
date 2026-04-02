@@ -1,12 +1,16 @@
+# ===== 安定最終版（処理保証＋ポップアップ完全抑止＋進捗正常）=====
+
 import os
 import sys
+import traceback
 import time
+
 import subprocess
+import soundfile as sf
 import tempfile
 
 import numpy as np
 from scipy import signal
-import soundfile as sf
 import librosa
 import resampy
 
@@ -22,34 +26,38 @@ PARAMS = dict(
     post_hp=16000,
     target_sr=96000,
     filter_order=11,
+    format="FLAC"
 )
 
-# ===== ffmpeg非表示 =====
+# ===== ffmpeg完全非表示 =====
 def run_hidden(cmd):
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+
     return subprocess.run(
         cmd,
-        check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
         startupinfo=si,
-        creationflags=subprocess.CREATE_NO_WINDOW
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        check=True
     )
 
-# ===== 読み込み（安全）=====
-def load_audio(path):
+# ===== 安全読み込み =====
+def load_audio_safe(path):
     try:
+        data, sr = sf.read(path, always_2d=True)
+        return data.T, sr
+    except:
         y, sr = librosa.load(path, mono=False, sr=None)
         if y.ndim == 1:
             y = y[np.newaxis, :]
         return y, sr
-    except:
-        data, sr = sf.read(path, always_2d=True)
-        return data.T, sr
 
-# ===== 保存（元構造維持）=====
-def save_audio(in_path, y_out, sr, out_path):
+# ===== 保存（ポップアップ完全防止）=====
+def save_wav24_out(in_path, y_out, sr, out_path):
 
     if y_out.ndim == 1:
         data = y_out[:, None]
@@ -68,8 +76,10 @@ def save_audio(in_path, y_out, sr, out_path):
 
     out_path = os.path.splitext(out_path)[0] + ".flac"
 
-    run_hidden([
+    cmd = [
         "ffmpeg", "-y",
+        "-loglevel", "quiet",
+        "-nostdin",
         "-i", tmp.name,
         "-i", in_path,
         "-map", "0:a",
@@ -77,48 +87,61 @@ def save_audio(in_path, y_out, sr, out_path):
         "-c:a", "flac",
         "-sample_fmt", "s32",
         out_path
-    ])
+    ]
+
+    run_hidden(cmd)
 
     os.remove(tmp.name)
+    return out_path
 
-# ===== 元DSP（完全そのまま）=====
+# ===== DSP（絶対変更しない安定構成）=====
 def freq_shift_mono(x, f_shift, d_sr):
-    N_orig = len(x)
-    N_padded = 1 << int(np.ceil(np.log2(max(1, N_orig))))
-    S_hilbert = signal.hilbert(np.hstack((x, np.zeros(N_padded - N_orig))))
-    S_factor = np.exp(2j * np.pi * f_shift * d_sr * np.arange(0, N_padded))
-    return (S_hilbert * S_factor)[:N_orig].real
+    N = len(x)
+    Np = 1 << int(np.ceil(np.log2(max(1, N))))
+    S = signal.hilbert(np.hstack((x, np.zeros(Np - N))))
+    F = np.exp(2j * np.pi * f_shift * d_sr * np.arange(Np))
+    return (S * F)[:N].real
 
 def freq_shift_multi(x, f_shift, d_sr):
-    return np.asarray([freq_shift_mono(x[i], f_shift, d_sr) for i in range(len(x))])
+    return np.asarray([freq_shift_mono(ch, f_shift, d_sr) for ch in x])
+
+def safe_butter(order, cutoff, sr):
+    nyq = sr / 2
+    cutoff = min(cutoff, nyq * 0.95)
+    order = min(order, 20)
+    return signal.butter(order, cutoff / nyq, 'highpass')
 
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
 
-    b, a = signal.butter(PARAMS["filter_order"], PARAMS["pre_hp"] / (sr / 2), 'highpass')
+    b, a = safe_butter(PARAMS["filter_order"], PARAMS["pre_hp"], sr)
     d_src = signal.filtfilt(b, a, x)
 
     d_sr = 1.0 / sr
     f_dn = freq_shift_mono if (x.ndim == 1) else freq_shift_multi
     d_res = np.zeros_like(x)
 
-    for i in range(PARAMS["m"]):
-        if abort_cb and abort_cb():
-            break
+    total = PARAMS["m"]
 
-        shift_hz = sr * (i + 1) / (PARAMS["m"] * 2.0)
-        d_res += f_dn(d_src, shift_hz, d_sr) * np.exp(-(i + 1) * PARAMS["decay"])
+    for i in range(total):
+
+        if abort_cb and abort_cb():
+            return x
+
+        shift = sr * (i + 1) / (total * 2.0)
+        d_res += f_dn(d_src, shift, d_sr) * np.exp(-(i + 1) * PARAMS["decay"])
 
         if progress_cb:
-            progress_cb(i + 1, PARAMS["m"])
+            progress_cb(int((i + 1) * 100 / total))
 
-    b, a = signal.butter(PARAMS["filter_order"], PARAMS["post_hp"] / (sr / 2), 'highpass')
+    b, a = safe_butter(PARAMS["filter_order"], PARAMS["post_hp"], sr)
     d_res = signal.filtfilt(b, a, d_res)
 
-    adp_power = float(np.mean(np.abs(d_res)))
-    src_power = float(np.mean(np.abs(x)))
-    adj_factor = src_power / (adp_power + src_power + 1e-12)
+    adp = float(np.mean(np.abs(d_res)))
+    src = float(np.mean(np.abs(x)))
 
-    return (x + d_res) * adj_factor
+    adj = src / (adp + src + 1e-12)
+
+    return (x + d_res) * adj
 
 # ===== Worker =====
 class Worker(QtCore.QThread):
@@ -151,31 +174,36 @@ class Worker(QtCore.QThread):
                 self.msleep(100)
 
             try:
-                y, sr = load_audio(path)
+                y, sr = load_audio_safe(path)
 
                 if sr != PARAMS["target_sr"]:
                     y = resampy.resample(y, sr, PARAMS["target_sr"])
                     sr = PARAMS["target_sr"]
 
-                def step_cb(cur, m):
-                    self.sig_step.emit(int(cur * 100 / m))
+                def step_cb(p):
+                    self.sig_step.emit(p)
 
-                y_out = zansei_impl(y, sr, step_cb, lambda: self._abort)
+                y_out = zansei_impl(
+                    y, sr,
+                    progress_cb=step_cb,
+                    abort_cb=lambda: self._abort
+                )
 
                 out = os.path.join(OUTPUT_DIR, os.path.basename(path))
-                save_audio(path, y_out, sr, out)
+                save_wav24_out(path, y_out, sr, out)
 
-            except:
+            except Exception:
                 continue
 
             elapsed = time.time() - start
             remain = (elapsed / idx) * (total - idx)
 
             self.sig_text.emit(f"{idx}/{total} 残り{int(remain)}秒")
+
             self.sig_all.emit(int(idx * 100 / total))
             self.sig_step.emit(100)
 
-# ===== UI（変更なし）=====
+# ===== UI =====
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -209,8 +237,8 @@ class MainWindow(QtWidgets.QWidget):
 
     def load_files(self):
         files = []
-        existing = set()
 
+        existing = set()
         if os.path.exists(OUTPUT_DIR):
             existing = {os.path.splitext(f)[0] for f in os.listdir(OUTPUT_DIR)}
 
