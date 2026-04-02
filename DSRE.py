@@ -74,7 +74,10 @@ def save_wav24_out(in_path, y_out, sr, out_path, fmt="ALAC", normalize=True):
             cover_tmp.close()
             subprocess.run(
                 ["ffmpeg", "-y", "-i", in_path, "-an", "-c:v", "copy", cover_tmp.name],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
         except Exception:
             cover_tmp = None
@@ -106,7 +109,13 @@ def save_wav24_out(in_path, y_out, sr, out_path, fmt="ALAC", normalize=True):
                 out_path
             ]
 
-    subprocess.run(cmd, check=True)
+    subprocess.run(
+    cmd,
+    check=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    creationflags=subprocess.CREATE_NO_WINDOW
+)
     os.remove(tmp_wav.name)
     if fmt == "FLAC" and cover_tmp and os.path.exists(cover_tmp.name):
         os.remove(cover_tmp.name)
@@ -268,7 +277,7 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_outdir = QtWidgets.QPushButton("选择输出目录")
         self.le_outdir = QtWidgets.QLineEdit()
         self.le_outdir.setPlaceholderText("Output folder")
-        self.le_outdir.setText(os.path.abspath("output"))
+        self.le_outdir.setText(r"C:\Audio\DSRE\Output")
 
         # 参数
         self.sb_m = QtWidgets.QSpinBox()
@@ -342,6 +351,7 @@ class MainWindow(QtWidgets.QWidget):
         # 输出格式选择
         self.cb_format = QtWidgets.QComboBox()
         self.cb_format.addItems(["ALAC", "FLAC"])  # 两种可选格式
+        self.cb_format.setCurrentText("FLAC")
         vbtn.addWidget(QtWidgets.QLabel("输出编码格式"))
         vbtn.addWidget(self.cb_format)
 
