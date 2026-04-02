@@ -1,4 +1,4 @@
-name: Build DSRE (Private)
+name: Build DSRE Private
 
 on:
   workflow_dispatch:
@@ -14,36 +14,32 @@ jobs:
       - name: Python準備
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: 依存インストール
         run: |
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: EXE作成（_internal付き）
+      - name: ビルド（onedir）
         run: |
           pyinstaller DSRE.py ^
             --noconsole ^
+            --onedir ^
             --name DSRE ^
             --icon=logo.ico ^
             --add-data "logo.ico;." ^
-            --collect-all librosa ^
-            --collect-all resampy ^
-            --collect-all soundfile ^
-            --collect-all scipy ^
-            --collect-all numpy ^
-            --collect-all PySide6
+            --contents-directory _internal
 
-      - name: zip作成（元と同じ構成）
+      - name: zip化（元と同じ構造）
         run: |
           mkdir release
-          copy dist\DSRE.exe release\DSRE.exe
-          xcopy dist\DSRE release\_internal /E /I
-          powershell Compress-Archive -Path release\* -DestinationPath DSRE_custom.zip
+          copy dist\DSRE\DSRE.exe release\DSRE.exe
+          xcopy dist\DSRE\_internal release\_internal /E /I
+          powershell Compress-Archive -Path release\* -DestinationPath DSRE_private.zip
 
       - name: 成果物保存
         uses: actions/upload-artifact@v4
         with:
-          name: DSRE_custom
-          path: DSRE_custom.zip
+          name: DSRE_private
+          path: DSRE_private.zip
