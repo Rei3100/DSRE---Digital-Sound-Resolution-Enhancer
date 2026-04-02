@@ -22,14 +22,7 @@ jobs:
           pip install pyinstaller
 
       - name: ビルド（onedir）
-        run: |
-          pyinstaller DSRE.py ^
-            --noconsole ^
-            --onedir ^
-            --name DSRE ^
-            --icon=logo.ico ^
-            --add-data "logo.ico;." ^
-            --contents-directory _internal
+        run: pyinstaller DSRE.py --noconsole --onedir --name DSRE --icon=logo.ico --add-data "logo.ico;." --contents-directory _internal
 
       - name: zip化（元と同じ構造）
         run: |
