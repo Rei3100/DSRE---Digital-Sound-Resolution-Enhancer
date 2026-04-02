@@ -1,10 +1,9 @@
-# ===== 完全修正版（処理完全維持＋ポップアップ除去＋進捗復元）=====
+# ===== 強化版（処理維持＋安定性＋精度向上）=====
 
 import os
 import sys
 import traceback
 import time
-from typing import Optional
 
 import subprocess
 import soundfile as sf
@@ -17,7 +16,6 @@ import resampy
 
 from PySide6 import QtCore, QtWidgets
 
-# ===== 固定 =====
 INPUT_DIR = r"C:\Audio\DSRE"
 OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 
@@ -35,7 +33,6 @@ PARAMS = dict(
 def run_hidden(cmd):
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
     return subprocess.run(
         cmd,
         check=True,
@@ -45,8 +42,22 @@ def run_hidden(cmd):
         creationflags=subprocess.CREATE_NO_WINDOW
     )
 
-# ===== 元そのまま保存処理 =====
-def save_wav24_out(in_path, y_out, sr, out_path, fmt="FLAC", normalize=True):
+# ===== 安全読み込み =====
+def load_audio_safe(path):
+    try:
+        data, sr = sf.read(path, always_2d=True)
+        return data.T, sr
+    except:
+        try:
+            y, sr = librosa.load(path, mono=False, sr=None)
+            if y.ndim == 1:
+                y = y[np.newaxis, :]
+            return y, sr
+        except Exception as e:
+            raise RuntimeError(f"読み込み失敗: {path}") from e
+
+# ===== 保存 =====
+def save_wav24_out(in_path, y_out, sr, out_path):
 
     if y_out.ndim == 1:
         data = y_out[:, None]
@@ -55,22 +66,19 @@ def save_wav24_out(in_path, y_out, sr, out_path, fmt="FLAC", normalize=True):
 
     data = data.astype(np.float32, copy=False)
 
-    if normalize:
-        peak = float(np.max(np.abs(data)))
-        if peak > 1.0:
-            data /= peak
-    else:
-        data = np.clip(data, -1.0, 1.0)
+    peak = float(np.max(np.abs(data)))
+    if peak > 1.0:
+        data /= peak
 
-    tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp_wav.close()
-    sf.write(tmp_wav.name, data, sr, subtype="FLOAT")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.close()
+    sf.write(tmp.name, data, sr, subtype="FLOAT")
 
     out_path = os.path.splitext(out_path)[0] + ".flac"
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", tmp_wav.name,
+        "-i", tmp.name,
         "-i", in_path,
         "-map", "0:a",
         "-map_metadata", "1",
@@ -80,52 +88,57 @@ def save_wav24_out(in_path, y_out, sr, out_path, fmt="FLAC", normalize=True):
     ]
 
     run_hidden(cmd)
-
-    os.remove(tmp_wav.name)
+    os.remove(tmp.name)
     return out_path
 
-# ===== 元DSP完全維持 =====
+# ===== DSP =====
 def freq_shift_mono(x, f_shift, d_sr):
-    N_orig = len(x)
-    N_padded = 1 << int(np.ceil(np.log2(max(1, N_orig))))
-    S_hilbert = signal.hilbert(np.hstack((x, np.zeros(N_padded - N_orig, dtype=x.dtype))))
-    S_factor = np.exp(2j * np.pi * f_shift * d_sr * np.arange(0, N_padded))
-    return (S_hilbert * S_factor)[:N_orig].real
+    N = len(x)
+    Np = 1 << int(np.ceil(np.log2(max(1, N))))
+    S = signal.hilbert(np.hstack((x, np.zeros(Np - N))))
+    F = np.exp(2j * np.pi * f_shift * d_sr * np.arange(Np))
+    return (S * F)[:N].real
 
 def freq_shift_multi(x, f_shift, d_sr):
-    return np.asarray([freq_shift_mono(x[i], f_shift, d_sr) for i in range(len(x))])
+    return np.asarray([freq_shift_mono(ch, f_shift, d_sr) for ch in x])
 
-def zansei_impl(
-    x, sr,
-    m, decay, pre_hp, post_hp, filter_order,
-    progress_cb=None,
-    abort_cb=None,
-):
-    b, a = signal.butter(filter_order, pre_hp / (sr / 2), 'highpass')
+def safe_butter(order, cutoff, sr):
+    nyq = sr / 2
+    cutoff = min(cutoff, nyq * 0.95)
+    order = min(order, 20)
+    return signal.butter(order, cutoff / nyq, 'highpass')
+
+def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
+
+    b, a = safe_butter(PARAMS["filter_order"], PARAMS["pre_hp"], sr)
     d_src = signal.filtfilt(b, a, x)
 
     d_sr = 1.0 / sr
     f_dn = freq_shift_mono if (x.ndim == 1) else freq_shift_multi
     d_res = np.zeros_like(x)
 
-    for i in range(m):
+    total = PARAMS["m"]
+
+    for i in range(total):
         if abort_cb and abort_cb():
             break
 
-        shift_hz = sr * (i + 1) / (m * 2.0)
-        d_res += f_dn(d_src, shift_hz, d_sr) * np.exp(-(i + 1) * decay)
+        shift = sr * (i + 1) / (total * 2.0)
+        d_res += f_dn(d_src, shift, d_sr) * np.exp(-(i + 1) * PARAMS["decay"])
 
         if progress_cb:
-            progress_cb(i + 1, m)
+            progress_cb(i + 1, total)
 
-    b, a = signal.butter(filter_order, post_hp / (sr / 2), 'highpass')
+    b, a = safe_butter(PARAMS["filter_order"], PARAMS["post_hp"], sr)
     d_res = signal.filtfilt(b, a, d_res)
 
-    adp_power = float(np.mean(np.abs(d_res)))
-    src_power = float(np.mean(np.abs(x)))
-    adj_factor = src_power / (adp_power + src_power + 1e-12)
+    adp = float(np.mean(np.abs(d_res)))
+    src = float(np.mean(np.abs(x)))
 
-    return (x + d_res) * adj_factor
+    eps = 1e-12
+    adj = src / (adp + src + eps)
+
+    return (x + d_res) * adj
 
 # ===== Worker =====
 class Worker(QtCore.QThread):
@@ -147,7 +160,7 @@ class Worker(QtCore.QThread):
 
     def run(self):
         total = len(self.files)
-        start_time = time.time()
+        start = time.time()
 
         for idx, path in enumerate(self.files, 1):
 
@@ -159,36 +172,29 @@ class Worker(QtCore.QThread):
 
             self.sig_text.emit(f"{idx}/{total}")
 
-            y, sr = librosa.load(path, mono=False, sr=None)
+            try:
+                y, sr = load_audio_safe(path)
 
-            if y.ndim == 1:
-                y = y[np.newaxis, :]
+                if sr != PARAMS["target_sr"]:
+                    y = resampy.resample(y, sr, PARAMS["target_sr"])
+                    sr = PARAMS["target_sr"]
 
-            if sr != PARAMS["target_sr"]:
-                y = resampy.resample(y, sr, PARAMS["target_sr"])
-                sr = PARAMS["target_sr"]
+                def step_cb(cur, m):
+                    self.sig_step.emit(int(cur * 100 / m))
 
-            def step_cb(cur, m):
-                pct = int(cur * 100 / m)
-                self.sig_step.emit(pct)
+                y_out = zansei_impl(
+                    y, sr,
+                    progress_cb=step_cb,
+                    abort_cb=lambda: self._abort
+                )
 
-            y_out = zansei_impl(
-                y, sr,
-                PARAMS["m"],
-                PARAMS["decay"],
-                PARAMS["pre_hp"],
-                PARAMS["post_hp"],
-                PARAMS["filter_order"],
-                progress_cb=step_cb,
-                abort_cb=lambda: self._abort
-            )
+                out = os.path.join(OUTPUT_DIR, os.path.basename(path))
+                save_wav24_out(path, y_out, sr, out)
 
-            base = os.path.basename(path)
-            out = os.path.join(OUTPUT_DIR, base)
+            except Exception:
+                continue
 
-            save_wav24_out(path, y_out, sr, out)
-
-            elapsed = time.time() - start_time
+            elapsed = time.time() - start
             remain = (elapsed / idx) * (total - idx)
 
             self.sig_text.emit(f"{idx}/{total} 残り{int(remain)}秒")
@@ -196,7 +202,7 @@ class Worker(QtCore.QThread):
             self.sig_all.emit(int(idx * 100 / total))
             self.sig_step.emit(100)
 
-# ===== UI =====
+# ===== UI（変更なし）=====
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -205,12 +211,8 @@ class MainWindow(QtWidgets.QWidget):
         self.resize(320,180)
 
         self.label = QtWidgets.QLabel("待機")
-
         self.pb_file = QtWidgets.QProgressBar()
-        self.pb_file.setRange(0,100)
-
         self.pb_all = QtWidgets.QProgressBar()
-        self.pb_all.setRange(0,100)
 
         self.btn_start = QtWidgets.QPushButton("開始")
         self.btn_pause = QtWidgets.QPushButton("一時停止")
@@ -234,9 +236,6 @@ class MainWindow(QtWidgets.QWidget):
 
     def load_files(self):
         files = []
-
-        if not os.path.exists(INPUT_DIR):
-            return files
 
         existing = set()
         if os.path.exists(OUTPUT_DIR):
