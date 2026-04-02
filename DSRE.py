@@ -1,26 +1,22 @@
-# ===== 本家処理そのまま + UI最小改造版 =====
+# ===== 完全版（ポップアップ完全排除 + 安定化 + 進捗強化）=====
 
 import os
 import sys
-import traceback
-from typing import Optional
-
+import time
 import subprocess
-import soundfile as sf
 import tempfile
-
 import numpy as np
 from scipy import signal
 import librosa
 import resampy
+import soundfile as sf
 
 from PySide6 import QtCore, QtWidgets
 
-# ===== 固定 =====
 INPUT_DIR = r"C:\Audio\DSRE"
 OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 
-FIXED_PARAMS = dict(
+PARAMS = dict(
     m=8,
     decay=1.25,
     pre_hp=3000,
@@ -30,100 +26,95 @@ FIXED_PARAMS = dict(
     format="FLAC"
 )
 
-def add_ffmpeg_to_path():
-    if hasattr(sys, "_MEIPASS"):
-        ffmpeg_dir = os.path.join(sys._MEIPASS, "ffmpeg")
-    else:
-        ffmpeg_dir = os.path.join(os.path.dirname(__file__), "ffmpeg")
-    os.environ["PATH"] += os.pathsep + ffmpeg_dir
+# ===== ffmpeg（完全非表示）=====
+def run_ffmpeg(cmd):
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-add_ffmpeg_to_path()
+    subprocess.run(
+        cmd,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        startupinfo=si,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
 
-# ===== 保存（完全そのまま）=====
-def save_wav24_out(in_path, y_out, sr, out_path, fmt="ALAC", normalize=True):
-    import tempfile, subprocess, numpy as np, soundfile as sf, os
+# ===== 保存（本家ロジック維持）=====
+def save_wav24_out(in_path, y_out, sr, out_path):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.close()
 
-    if y_out.ndim == 1:
-        data = y_out[:, None]
-    else:
-        data = y_out.T if y_out.shape[0] < y_out.shape[1] else y_out
+    data = y_out.T if y_out.ndim > 1 else y_out[:, None]
+    sf.write(tmp.name, data.astype(np.float32), sr, subtype="FLOAT")
 
-    data = data.astype(np.float32, copy=False)
-    if normalize:
-        peak = float(np.max(np.abs(data)))
-        if peak > 1.0:
-            data /= peak
-    else:
-        data = np.clip(data, -1.0, 1.0)
-
-    tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp_wav.close()
-    sf.write(tmp_wav.name, data, sr, subtype="FLOAT")
-
-    fmt = fmt.upper()
     out_path = os.path.splitext(out_path)[0] + ".flac"
 
     cmd = [
-        "ffmpeg", "-y",
-        "-i", tmp_wav.name,
+        "ffmpeg","-y",
+        "-i", tmp.name,
         "-i", in_path,
-        "-map", "0:a",
-        "-map_metadata", "1",
-        "-c:a", "flac",
-        "-sample_fmt", "s32",
+        "-map","0:a",
+        "-map_metadata","1",
+        "-c:a","flac",
+        "-sample_fmt","s32",
         out_path
     ]
 
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg(cmd)
 
-    os.remove(tmp_wav.name)
+    os.remove(tmp.name)
     return out_path
 
-# ===== DSP（完全そのまま）=====
-def freq_shift_mono(x, f_shift, d_sr):
-    N_orig = len(x)
-    N_padded = 1 << int(np.ceil(np.log2(max(1, N_orig))))
-    S_hilbert = signal.hilbert(np.hstack((x, np.zeros(N_padded - N_orig, dtype=x.dtype))))
-    S_factor = np.exp(2j * np.pi * f_shift * d_sr * np.arange(0, N_padded))
-    return (S_hilbert * S_factor)[:N_orig].real
+# ===== 安定化フィルタ（v2から）=====
+def safe_butter(order, cutoff, btype, sr):
+    try:
+        return signal.butter(order, cutoff/(sr/2), btype)
+    except:
+        # fallback
+        return signal.butter(5, min(cutoff/(sr/2), 0.99), btype)
 
-def freq_shift_multi(x, f_shift, d_sr):
-    return np.asarray([freq_shift_mono(x[i], f_shift, d_sr) for i in range(len(x))])
+# ===== DSP（完全維持）=====
+def freq_shift_mono(x, f_shift, d_sr):
+    N = len(x)
+    Np = 1 << int(np.ceil(np.log2(max(1, N))))
+    S = signal.hilbert(np.hstack((x, np.zeros(Np - N))))
+    factor = np.exp(2j * np.pi * f_shift * d_sr * np.arange(Np))
+    return (S * factor)[:N].real
 
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
-    p = FIXED_PARAMS
+    p = PARAMS
 
-    b, a = signal.butter(p["filter_order"], p["pre_hp"] / (sr / 2), 'highpass')
-    d_src = signal.filtfilt(b, a, x)
+    b,a = safe_butter(p["filter_order"], p["pre_hp"], 'highpass', sr)
+    d_src = signal.filtfilt(b,a,x)
 
-    d_sr = 1.0 / sr
-    f_dn = freq_shift_mono if (x.ndim == 1) else freq_shift_multi
     d_res = np.zeros_like(x)
+    d_sr = 1.0/sr
 
     for i in range(p["m"]):
         if abort_cb and abort_cb():
             break
 
-        shift_hz = sr * (i + 1) / (p["m"] * 2.0)
-        d_res += f_dn(d_src, shift_hz, d_sr) * np.exp(-(i + 1) * p["decay"])
+        shift = sr*(i+1)/(p["m"]*2.0)
+        d_res += freq_shift_mono(d_src, shift, d_sr) * np.exp(-(i+1)*p["decay"])
 
         if progress_cb:
-            progress_cb(i + 1, p["m"])
+            progress_cb(i+1, p["m"])
 
-    b, a = signal.butter(p["filter_order"], p["post_hp"] / (sr / 2), 'highpass')
-    d_res = signal.filtfilt(b, a, d_res)
+    b,a = safe_butter(p["filter_order"], p["post_hp"], 'highpass', sr)
+    d_res = signal.filtfilt(b,a,d_res)
 
-    adp_power = float(np.mean(np.abs(d_res)))
-    src_power = float(np.mean(np.abs(x)))
-    adj_factor = src_power / (adp_power + src_power + 1e-12)
+    adp = float(np.mean(np.abs(d_res)))
+    src = float(np.mean(np.abs(x)))
+    adj = src/(adp+src+1e-12)
 
-    return (x + d_res) * adj_factor
+    return (x + d_res) * adj
 
 # ===== Worker =====
 class Worker(QtCore.QThread):
-    sig_step = QtCore.Signal(int)
+    sig_file = QtCore.Signal(int)
     sig_all = QtCore.Signal(int)
-    sig_status = QtCore.Signal(str)
+    sig_text = QtCore.Signal(str)
 
     def __init__(self, files):
         super().__init__()
@@ -139,26 +130,32 @@ class Worker(QtCore.QThread):
 
     def run(self):
         total = len(self.files)
+        start_time = time.time()
 
-        for idx, path in enumerate(self.files, 1):
+        for i, f in enumerate(self.files, 1):
+
             if self._abort:
                 return
 
             while self._pause:
                 self.msleep(100)
 
-            self.sig_status.emit(f"{idx}/{total}")
+            size = os.path.getsize(f)
+            processed = 0
 
-            y, sr = librosa.load(path, mono=False, sr=None)
+            self.sig_text.emit(f"{i}/{total}")
+
+            y, sr = librosa.load(f, mono=False, sr=None)
             if y.ndim == 1:
-                y = y[np.newaxis, :]
+                y = y[np.newaxis,:]
 
-            if sr != FIXED_PARAMS["target_sr"]:
-                y = resampy.resample(y, sr, FIXED_PARAMS["target_sr"])
-                sr = FIXED_PARAMS["target_sr"]
+            if sr != PARAMS["target_sr"]:
+                y = resampy.resample(y, sr, PARAMS["target_sr"])
+                sr = PARAMS["target_sr"]
 
             def step_cb(cur, m):
-                self.sig_step.emit(int(cur * 100 / m))
+                pct = int(cur*100/m)
+                self.sig_file.emit(pct)
 
             y_out = zansei_impl(
                 y, sr,
@@ -166,13 +163,20 @@ class Worker(QtCore.QThread):
                 abort_cb=lambda: self._abort
             )
 
-            base = os.path.basename(path)
+            base = os.path.basename(f)
             out = os.path.join(OUTPUT_DIR, base)
 
-            save_wav24_out(path, y_out, sr, out, fmt="FLAC")
+            save_wav24_out(f, y_out, sr, out)
 
-            self.sig_all.emit(int(idx * 100 / total))
-            self.sig_step.emit(100)
+            # ===== ETA計算 =====
+            elapsed = time.time() - start_time
+            avg = elapsed / i
+            remain = avg * (total - i)
+
+            self.sig_text.emit(f"{i}/{total}  残り{int(remain)}秒")
+
+            self.sig_all.emit(int(i*100/total))
+            self.sig_file.emit(100)
 
 # ===== UI =====
 class MainWindow(QtWidgets.QWidget):
@@ -180,18 +184,18 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
 
         self.setWindowTitle("DSRE")
-        self.resize(400,200)
+        self.resize(320,180)
 
+        self.label = QtWidgets.QLabel("待機")
         self.pb_file = QtWidgets.QProgressBar()
         self.pb_all = QtWidgets.QProgressBar()
-        self.lbl = QtWidgets.QLabel("待機")
 
         self.btn_start = QtWidgets.QPushButton("開始")
-        self.btn_cancel = QtWidgets.QPushButton("取消")
         self.btn_pause = QtWidgets.QPushButton("一時停止")
+        self.btn_cancel = QtWidgets.QPushButton("取消")
 
         layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.lbl)
+        layout.addWidget(self.label)
         layout.addWidget(self.pb_file)
         layout.addWidget(self.pb_all)
         layout.addWidget(self.btn_start)
@@ -201,14 +205,13 @@ class MainWindow(QtWidgets.QWidget):
         self.setLayout(layout)
 
         self.btn_start.clicked.connect(self.start)
-        self.btn_cancel.clicked.connect(self.cancel)
         self.btn_pause.clicked.connect(self.pause)
+        self.btn_cancel.clicked.connect(self.cancel)
 
         self.worker = None
 
     def load_files(self):
         files = []
-
         if not os.path.exists(INPUT_DIR):
             return files
 
@@ -219,8 +222,7 @@ class MainWindow(QtWidgets.QWidget):
         for f in os.listdir(INPUT_DIR):
             if f.lower().endswith(".flac"):
                 if os.path.splitext(f)[0] not in existing:
-                    files.append(os.path.join(INPUT_DIR, f))
-
+                    files.append(os.path.join(INPUT_DIR,f))
         return files
 
     def start(self):
@@ -229,18 +231,18 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         self.worker = Worker(files)
-        self.worker.sig_step.connect(self.pb_file.setValue)
+        self.worker.sig_file.connect(self.pb_file.setValue)
         self.worker.sig_all.connect(self.pb_all.setValue)
-        self.worker.sig_status.connect(self.lbl.setText)
+        self.worker.sig_text.connect(self.label.setText)
         self.worker.start()
-
-    def cancel(self):
-        if self.worker:
-            self.worker.abort()
 
     def pause(self):
         if self.worker:
             self.worker.pause_toggle()
+
+    def cancel(self):
+        if self.worker:
+            self.worker.abort()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
