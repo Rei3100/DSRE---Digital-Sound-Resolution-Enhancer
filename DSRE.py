@@ -24,7 +24,7 @@ PARAMS = dict(
     filter_order=11,
 )
 
-# ===== ffmpeg 非表示 =====
+# ===== ffmpeg非表示 =====
 def run_hidden(cmd):
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -37,25 +37,28 @@ def run_hidden(cmd):
         creationflags=subprocess.CREATE_NO_WINDOW
     )
 
-# ===== 安全読み込み =====
+# ===== 読み込み（安全）=====
 def load_audio(path):
     try:
-        data, sr = sf.read(path, always_2d=True)
-        return data.T.astype(np.float32, copy=False), sr
-    except:
         y, sr = librosa.load(path, mono=False, sr=None)
         if y.ndim == 1:
             y = y[np.newaxis, :]
-        return y.astype(np.float32, copy=False), sr
+        return y, sr
+    except:
+        data, sr = sf.read(path, always_2d=True)
+        return data.T, sr
 
-# ===== 保存 =====
-def save_audio(in_path, y, sr, out_path):
-    if y.ndim == 1:
-        data = y[:, None]
+# ===== 保存（元構造維持）=====
+def save_audio(in_path, y_out, sr, out_path):
+
+    if y_out.ndim == 1:
+        data = y_out[:, None]
     else:
-        data = y.T if y.shape[0] < y.shape[1] else y
+        data = y_out.T if y_out.shape[0] < y_out.shape[1] else y_out
 
-    peak = np.max(np.abs(data))
+    data = data.astype(np.float32, copy=False)
+
+    peak = float(np.max(np.abs(data)))
     if peak > 1.0:
         data /= peak
 
@@ -78,52 +81,44 @@ def save_audio(in_path, y, sr, out_path):
 
     os.remove(tmp.name)
 
-# ===== DSP =====
-def safe_butter(order, cutoff, sr):
-    nyq = sr * 0.5
-    cutoff = min(cutoff, nyq * 0.95)
-    order = min(order, 20)
-    return signal.butter(order, cutoff / nyq, "highpass")
+# ===== 元DSP（完全そのまま）=====
+def freq_shift_mono(x, f_shift, d_sr):
+    N_orig = len(x)
+    N_padded = 1 << int(np.ceil(np.log2(max(1, N_orig))))
+    S_hilbert = signal.hilbert(np.hstack((x, np.zeros(N_padded - N_orig))))
+    S_factor = np.exp(2j * np.pi * f_shift * d_sr * np.arange(0, N_padded))
+    return (S_hilbert * S_factor)[:N_orig].real
 
-def freq_shift(x, shift, d_sr):
-    N = x.shape[-1]
-    Np = 1 << int(np.ceil(np.log2(max(1, N))))
-    pad = np.zeros((x.shape[0], Np - N), dtype=x.dtype)
-    x_pad = np.concatenate([x, pad], axis=1)
+def freq_shift_multi(x, f_shift, d_sr):
+    return np.asarray([freq_shift_mono(x[i], f_shift, d_sr) for i in range(len(x))])
 
-    analytic = signal.hilbert(x_pad)
-    phase = np.exp(2j * np.pi * shift * d_sr * np.arange(Np))
+def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
 
-    return (analytic * phase)[:, :N].real
+    b, a = signal.butter(PARAMS["filter_order"], PARAMS["pre_hp"] / (sr / 2), 'highpass')
+    d_src = signal.filtfilt(b, a, x)
 
-def process(x, sr, progress_cb=None, abort_cb=None):
-    b, a = safe_butter(PARAMS["filter_order"], PARAMS["pre_hp"], sr)
-    src = signal.filtfilt(b, a, x)
-
-    res = np.zeros_like(x)
     d_sr = 1.0 / sr
+    f_dn = freq_shift_mono if (x.ndim == 1) else freq_shift_multi
+    d_res = np.zeros_like(x)
 
-    total = PARAMS["m"]
-
-    for i in range(total):
+    for i in range(PARAMS["m"]):
         if abort_cb and abort_cb():
             break
 
-        shift = sr * (i + 1) / (total * 2.0)
-        res += freq_shift(src, shift, d_sr) * np.exp(-(i + 1) * PARAMS["decay"])
+        shift_hz = sr * (i + 1) / (PARAMS["m"] * 2.0)
+        d_res += f_dn(d_src, shift_hz, d_sr) * np.exp(-(i + 1) * PARAMS["decay"])
 
         if progress_cb:
-            progress_cb(i + 1, total)
+            progress_cb(i + 1, PARAMS["m"])
 
-    b, a = safe_butter(PARAMS["filter_order"], PARAMS["post_hp"], sr)
-    res = signal.filtfilt(b, a, res)
+    b, a = signal.butter(PARAMS["filter_order"], PARAMS["post_hp"] / (sr / 2), 'highpass')
+    d_res = signal.filtfilt(b, a, d_res)
 
-    p_res = np.mean(np.abs(res))
-    p_src = np.mean(np.abs(x))
+    adp_power = float(np.mean(np.abs(d_res)))
+    src_power = float(np.mean(np.abs(x)))
+    adj_factor = src_power / (adp_power + src_power + 1e-12)
 
-    adj = p_src / (p_res + p_src + 1e-12)
-
-    return (x + res) * adj
+    return (x + d_res) * adj_factor
 
 # ===== Worker =====
 class Worker(QtCore.QThread):
@@ -156,21 +151,19 @@ class Worker(QtCore.QThread):
                 self.msleep(100)
 
             try:
-                x, sr = load_audio(path)
-
-                length = x.shape[-1]
+                y, sr = load_audio(path)
 
                 if sr != PARAMS["target_sr"]:
-                    x = resampy.resample(x, sr, PARAMS["target_sr"], axis=1)
+                    y = resampy.resample(y, sr, PARAMS["target_sr"])
                     sr = PARAMS["target_sr"]
 
                 def step_cb(cur, m):
                     self.sig_step.emit(int(cur * 100 / m))
 
-                y = process(x, sr, step_cb, lambda: self._abort)
+                y_out = zansei_impl(y, sr, step_cb, lambda: self._abort)
 
                 out = os.path.join(OUTPUT_DIR, os.path.basename(path))
-                save_audio(path, y, sr, out)
+                save_audio(path, y_out, sr, out)
 
             except:
                 continue
@@ -179,11 +172,10 @@ class Worker(QtCore.QThread):
             remain = (elapsed / idx) * (total - idx)
 
             self.sig_text.emit(f"{idx}/{total} 残り{int(remain)}秒")
-
             self.sig_all.emit(int(idx * 100 / total))
             self.sig_step.emit(100)
 
-# ===== UI =====
+# ===== UI（変更なし）=====
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
