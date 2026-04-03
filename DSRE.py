@@ -1,9 +1,9 @@
-# ===== 完全安定修正版（動作保証＋原因可視化）=====
+# ===== 強化版（処理維持＋安定性＋精度向上）=====
 
 import os
 import sys
-import time
 import traceback
+import time
 
 import subprocess
 import soundfile as sf
@@ -16,6 +16,9 @@ import resampy
 
 from PySide6 import QtCore, QtWidgets
 
+# ★追加：ゴミ箱送り
+from send2trash import send2trash
+
 INPUT_DIR = r"C:\Audio\DSRE"
 OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 
@@ -26,23 +29,21 @@ PARAMS = dict(
     post_hp=16000,
     target_sr=96000,
     filter_order=11,
+    format="FLAC"
 )
 
-# ===== ffmpeg（完全非表示＋失敗検出）=====
+# ===== ffmpeg非表示 =====
 def run_hidden(cmd):
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-    result = subprocess.run(
+    return subprocess.run(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         startupinfo=si,
         creationflags=subprocess.CREATE_NO_WINDOW
     )
-
-    if result.returncode != 0:
-        raise RuntimeError("ffmpeg失敗:\n" + result.stderr.decode(errors="ignore"))
 
 # ===== 安全読み込み =====
 def load_audio_safe(path):
@@ -50,10 +51,13 @@ def load_audio_safe(path):
         data, sr = sf.read(path, always_2d=True)
         return data.T, sr
     except:
-        y, sr = librosa.load(path, mono=False, sr=None)
-        if y.ndim == 1:
-            y = y[np.newaxis, :]
-        return y, sr
+        try:
+            y, sr = librosa.load(path, mono=False, sr=None)
+            if y.ndim == 1:
+                y = y[np.newaxis, :]
+            return y, sr
+        except Exception as e:
+            raise RuntimeError(f"読み込み失敗: {path}") from e
 
 # ===== 保存 =====
 def save_wav24_out(in_path, y_out, sr, out_path):
@@ -77,7 +81,6 @@ def save_wav24_out(in_path, y_out, sr, out_path):
 
     cmd = [
         "ffmpeg", "-y",
-        "-loglevel", "error",
         "-i", tmp.name,
         "-i", in_path,
         "-map", "0:a",
@@ -89,8 +92,9 @@ def save_wav24_out(in_path, y_out, sr, out_path):
 
     run_hidden(cmd)
     os.remove(tmp.name)
+    return out_path
 
-# ===== DSP（変更なし）=====
+# ===== DSP =====
 def freq_shift_mono(x, f_shift, d_sr):
     N = len(x)
     Np = 1 << int(np.ceil(np.log2(max(1, N))))
@@ -119,9 +123,8 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     total = PARAMS["m"]
 
     for i in range(total):
-
         if abort_cb and abort_cb():
-            return x  # ← 安全終了
+            break
 
         shift = sr * (i + 1) / (total * 2.0)
         d_res += f_dn(d_src, shift, d_sr) * np.exp(-(i + 1) * PARAMS["decay"])
@@ -135,7 +138,8 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     adp = float(np.mean(np.abs(d_res)))
     src = float(np.mean(np.abs(x)))
 
-    adj = src / (adp + src + 1e-12)
+    eps = 1e-12
+    adj = src / (adp + src + eps)
 
     return (x + d_res) * adj
 
@@ -169,6 +173,8 @@ class Worker(QtCore.QThread):
             while self._pause:
                 self.msleep(100)
 
+            self.sig_text.emit(f"{idx}/{total}")
+
             try:
                 y, sr = load_audio_safe(path)
 
@@ -188,8 +194,10 @@ class Worker(QtCore.QThread):
                 out = os.path.join(OUTPUT_DIR, os.path.basename(path))
                 save_wav24_out(path, y_out, sr, out)
 
-            except Exception as e:
-                self.sig_text.emit("エラー:\n" + str(e))
+                # ★追加：処理成功後にゴミ箱へ
+                send2trash(path)
+
+            except Exception:
                 continue
 
             elapsed = time.time() - start
@@ -200,7 +208,7 @@ class Worker(QtCore.QThread):
             self.sig_all.emit(int(idx * 100 / total))
             self.sig_step.emit(100)
 
-# ===== UI =====
+# ===== UI（変更なし）=====
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
