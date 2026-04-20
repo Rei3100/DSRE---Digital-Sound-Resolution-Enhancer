@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 build/
 dist/
-*.spec
 .venv/
 venv/
+release/
+build-manifest.txt
+*.spec
+!DSRE.spec
