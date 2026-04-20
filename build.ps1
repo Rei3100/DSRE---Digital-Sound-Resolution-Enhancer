@@ -38,8 +38,9 @@ Write-Host "[build] structural smoke OK"
 
 Write-Host "[build] runtime selftest (--selftest)"
 $exe = Join-Path $dist "DSRE.exe"
-& $exe --selftest
-$code = $LASTEXITCODE
+# windowed exe は & 演算子だと detach するので Start-Process -Wait -PassThru で完了待機
+$proc = Start-Process -FilePath $exe -ArgumentList "--selftest" -Wait -PassThru
+$code = $proc.ExitCode
 $log = Join-Path $dist "selftest.log"
 if (Test-Path $log) {
     Write-Host "---- selftest.log ----"

@@ -88,8 +88,9 @@ try {
     # 実起動スモーク: exe --selftest で import を exercise
     Write-Host "[deploy] runtime selftest (--selftest)"
     $exeForTest = Join-Path $TargetDir "DSRE.exe"
-    & $exeForTest --selftest
-    $selftestCode = $LASTEXITCODE
+    # windowed exe は & 演算子だと detach するので Start-Process -Wait -PassThru で完了待機
+    $selftestProc = Start-Process -FilePath $exeForTest -ArgumentList "--selftest" -Wait -PassThru
+    $selftestCode = $selftestProc.ExitCode
     $log = Join-Path $TargetDir "selftest.log"
     if (Test-Path $log) {
         Write-Host "---- selftest.log ----"

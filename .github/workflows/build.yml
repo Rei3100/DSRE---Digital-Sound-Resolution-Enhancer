@@ -75,8 +75,9 @@ jobs:
       - name: 実起動スモーク (--selftest で import を exercise)
         shell: pwsh
         run: |
-          & dist\DSRE\DSRE.exe --selftest
-          $code = $LASTEXITCODE
+          # windowed exe は & 演算子だと detach するので Start-Process -Wait -PassThru で完了待機
+          $proc = Start-Process -FilePath "dist\DSRE\DSRE.exe" -ArgumentList "--selftest" -Wait -PassThru
+          $code = $proc.ExitCode
           $log = "dist\DSRE\selftest.log"
           if (Test-Path $log) {
             Write-Host "---- selftest.log ----"
