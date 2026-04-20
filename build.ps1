@@ -34,5 +34,19 @@ foreach ($r in $required) {
     if (-not (Test-Path $p)) { throw "MISSING after build: $p" }
 }
 
-Write-Host "[build] OK -> $dist\DSRE.exe"
+Write-Host "[build] structural smoke OK"
+
+Write-Host "[build] runtime selftest (--selftest)"
+$exe = Join-Path $dist "DSRE.exe"
+& $exe --selftest
+$code = $LASTEXITCODE
+$log = Join-Path $dist "selftest.log"
+if (Test-Path $log) {
+    Write-Host "---- selftest.log ----"
+    Get-Content $log
+    Write-Host "----------------------"
+}
+if ($code -ne 0) { throw "runtime selftest failed with exit $code" }
+
+Write-Host "[build] OK -> $exe"
 Write-Host "[build] deploy with: powershell -File $PSScriptRoot\deploy.ps1 -Source '$dist'"

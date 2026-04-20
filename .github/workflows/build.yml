@@ -72,6 +72,21 @@ jobs:
           if ($sfOk -eq 0) { throw "MISSING: soundfile module / libsndfile DLL" }
           Write-Host "smoke test OK"
 
+      - name: 実起動スモーク (--selftest で import を exercise)
+        shell: pwsh
+        run: |
+          & dist\DSRE\DSRE.exe --selftest
+          $code = $LASTEXITCODE
+          $log = "dist\DSRE\selftest.log"
+          if (Test-Path $log) {
+            Write-Host "---- selftest.log ----"
+            Get-Content $log
+            Write-Host "----------------------"
+          } else {
+            Write-Host "selftest.log not generated"
+          }
+          if ($code -ne 0) { throw "runtime selftest failed with exit $code" }
+
       - name: zip 化（_internal + exe を release 直下に配置）
         shell: pwsh
         run: |

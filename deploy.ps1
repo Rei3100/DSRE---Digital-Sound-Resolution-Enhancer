@@ -83,7 +83,23 @@ Copy-Item (Join-Path $Source "*") $TargetDir -Recurse -Force
 # 5. 配置後スモーク (失敗したらロールバック)
 try {
     Assert-Layout -root $TargetDir
-    Write-Host "[deploy] layout OK"
+    Write-Host "[deploy] structural smoke OK"
+
+    # 実起動スモーク: exe --selftest で import を exercise
+    Write-Host "[deploy] runtime selftest (--selftest)"
+    $exeForTest = Join-Path $TargetDir "DSRE.exe"
+    & $exeForTest --selftest
+    $selftestCode = $LASTEXITCODE
+    $log = Join-Path $TargetDir "selftest.log"
+    if (Test-Path $log) {
+        Write-Host "---- selftest.log ----"
+        Get-Content $log
+        Write-Host "----------------------"
+    }
+    if ($selftestCode -ne 0) {
+        throw "runtime selftest failed with exit $selftestCode"
+    }
+    Write-Host "[deploy] runtime selftest OK"
 } catch {
     Write-Warning "[deploy] smoke failed, rolling back: $_"
     Remove-Item $TargetDir -Recurse -Force -ErrorAction SilentlyContinue
