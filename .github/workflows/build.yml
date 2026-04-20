@@ -2,37 +2,63 @@ name: Build DSRE Private
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'DSRE.py'
+      - 'DSRE.spec'
+      - 'requirements.txt'
+      - 'requirements-dev.txt'
+      - '.github/workflows/build.yml'
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
       - name: コード取得
         uses: actions/checkout@v4
 
-      - name: Python準備
+      - name: Python 3.11 準備
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: pip
 
       - name: 依存インストール
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install -r requirements-dev.txt
 
-      - name: ビルド（onedir）
-        run: pyinstaller DSRE.py --noconsole --onedir --name DSRE --icon=logo.ico --add-data "logo.ico;." --contents-directory _internal
+      - name: 依存バージョン記録
+        run: pip freeze > build-manifest.txt
 
-      - name: zip化（元と同じ構造）
+      - name: ビルド（spec 経由）
+        run: pyinstaller DSRE.spec --clean --noconfirm
+
+      - name: スモークテスト（必須依存の同梱確認）
+        shell: pwsh
         run: |
-          mkdir release
-          copy dist\DSRE\DSRE.exe release\DSRE.exe
-          xcopy dist\DSRE\_internal release\_internal /E /I
-          powershell Compress-Archive -Path release\* -DestinationPath DSRE_private.zip
+          $dist = "dist/DSRE"
+          $required = @("_internal/numpy", "_internal/scipy", "_internal/librosa", "_internal/numba", "_internal/llvmlite", "_internal/resampy", "_internal/soundfile", "DSRE.exe")
+          foreach ($r in $required) {
+            $p = Join-Path $dist $r
+            if (-not (Test-Path $p)) { throw "MISSING: $p" }
+          }
+          Write-Host "smoke test OK"
+
+      - name: zip 化（_internal + exe を release 直下に配置）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release | Out-Null
+          Copy-Item dist\DSRE\DSRE.exe release\DSRE.exe
+          Copy-Item dist\DSRE\_internal release\_internal -Recurse
+          Compress-Archive -Path release\* -DestinationPath DSRE_private.zip
 
       - name: 成果物保存
         uses: actions/upload-artifact@v4
         with:
           name: DSRE_private
-          path: DSRE_private.zip
+          path: |
+            DSRE_private.zip
+            build-manifest.txt
