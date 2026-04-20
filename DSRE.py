@@ -188,6 +188,7 @@ class Worker(QtCore.QThread):
         self._mutex = QtCore.QMutex()
         self._wait = QtCore.QWaitCondition()
         self._failed: list[str] = []
+        self._trash_failed = 0
 
     def abort(self):
         self._mutex.lock()
@@ -245,7 +246,7 @@ class Worker(QtCore.QThread):
                 try:
                     send2trash(path)
                 except Exception:
-                    pass
+                    self._trash_failed += 1
 
                 succeeded += 1
 
@@ -255,17 +256,29 @@ class Worker(QtCore.QThread):
             elapsed = time.time() - start
             remain = (elapsed / idx) * (total - idx)
             fail_n = len(self._failed)
-            suffix = f"  失敗{fail_n}" if fail_n else ""
+            parts = []
+            if fail_n:
+                parts.append(f"失敗{fail_n}")
+            if self._trash_failed:
+                parts.append(f"ゴミ箱{self._trash_failed}")
+            suffix = ("  " + "  ".join(parts)) if parts else ""
             self.sig_text.emit(f"{idx}/{total}  残り{int(remain)}秒{suffix}")
 
             self.sig_all.emit(int(idx * 100 / total))
             self.sig_step.emit(100)
 
         fail_n = len(self._failed)
+        trash_n = self._trash_failed
+        extras = []
+        if fail_n:
+            extras.append(f"失敗{fail_n}")
+        if trash_n:
+            extras.append(f"ゴミ箱{trash_n}")
+        tail = ("  " + "  ".join(extras)) if extras else ""
         if self._abort:
-            self.sig_text.emit(f"中断  成功{succeeded}/{total}  失敗{fail_n}")
-        elif fail_n:
-            self.sig_text.emit(f"完了  成功{succeeded}/{total}  失敗{fail_n}")
+            self.sig_text.emit(f"中断  成功{succeeded}/{total}{tail}")
+        elif extras:
+            self.sig_text.emit(f"完了  成功{succeeded}/{total}{tail}")
         else:
             self.sig_text.emit(f"完了  {succeeded}/{total}")
 
