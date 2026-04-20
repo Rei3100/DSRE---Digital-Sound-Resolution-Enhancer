@@ -32,8 +32,8 @@ hiddenimports += [
     "scipy.signal",
     "scipy.signal._peak_finding_utils",
     "scipy.special.cython_special",
-    "numpy.core._methods",
-    "numpy.core._dtype_ctypes",
+    "soundfile",
+    "_soundfile",
 ]
 
 a = Analysis(

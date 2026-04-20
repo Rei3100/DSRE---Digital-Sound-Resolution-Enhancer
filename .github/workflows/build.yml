@@ -30,6 +30,17 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
+      - name: requirements 検証 (UTF-16 bytes禁止)
+        shell: pwsh
+        run: |
+          foreach ($f in @("requirements.txt", "requirements-dev.txt")) {
+            $b = [System.IO.File]::ReadAllBytes($f)
+            if ($b.Length -ge 4 -and $b[1] -eq 0 -and $b[3] -eq 0) {
+              throw "$f is UTF-16 encoded. pip can't parse it. Re-save as UTF-8."
+            }
+          }
+          python -c "import numpy, scipy, librosa, soundfile, resampy, send2trash; print('deps installed OK')"
+
       - name: 依存バージョン記録
         run: pip freeze > build-manifest.txt
 
@@ -40,11 +51,25 @@ jobs:
         shell: pwsh
         run: |
           $dist = "dist/DSRE"
-          $required = @("_internal/numpy", "_internal/scipy", "_internal/librosa", "_internal/numba", "_internal/llvmlite", "_internal/resampy", "_internal/soundfile", "DSRE.exe")
-          foreach ($r in $required) {
+          # ディレクトリとして存在すべき依存 (パッケージ形式)
+          $dirs = @("_internal/numpy", "_internal/scipy", "_internal/librosa",
+                    "_internal/numba", "_internal/llvmlite", "_internal/resampy",
+                    "_internal/PySide6")
+          foreach ($r in $dirs) {
             $p = Join-Path $dist $r
-            if (-not (Test-Path $p)) { throw "MISSING: $p" }
+            if (-not (Test-Path $p -PathType Container)) { throw "MISSING dir: $p" }
           }
+          # ファイルとして存在すべき単一モジュール依存
+          $files = @("DSRE.exe")
+          foreach ($r in $files) {
+            $p = Join-Path $dist $r
+            if (-not (Test-Path $p -PathType Leaf)) { throw "MISSING file: $p" }
+          }
+          # soundfile は単一モジュール: soundfile.py または _soundfile*.pyd / libsndfile*.dll
+          $sfOk = @(Get-ChildItem -Path "$dist/_internal" -Filter "soundfile*" -ErrorAction SilentlyContinue).Count +
+                  @(Get-ChildItem -Path "$dist/_internal" -Filter "_soundfile*" -ErrorAction SilentlyContinue).Count +
+                  @(Get-ChildItem -Path "$dist/_internal" -Filter "libsndfile*" -ErrorAction SilentlyContinue).Count
+          if ($sfOk -eq 0) { throw "MISSING: soundfile module / libsndfile DLL" }
           Write-Host "smoke test OK"
 
       - name: zip 化（_internal + exe を release 直下に配置）
