@@ -368,7 +368,53 @@ class MainWindow(QtWidgets.QWidget):
         event.accept()
 
 
+def _run_selftest() -> int:
+    """ビルド成果物が最低限 import できることを確認するセルフテスト。
+
+    PyInstaller の excludes や hidden import の抜けで起動不能になる事故を
+    CI / ローカル / デプロイ直前で捕まえるためのゲート。QApplication は作らない
+    (ヘッドレス CI 環境で Qt platform plugin 初期化を走らせないため)。
+    """
+    import traceback
+    log_dir = os.path.dirname(sys.executable) or os.getcwd()
+    log_path = os.path.join(log_dir, "selftest.log")
+    try:
+        import numpy as _np
+        import scipy as _sp
+        import scipy.signal as _sps
+        import scipy.linalg  # noqa: F401
+        import scipy.fft  # noqa: F401
+        import numpy.testing  # noqa: F401  # unittest 地雷検出用
+        import librosa as _lb
+        import resampy  # noqa: F401
+        import soundfile  # noqa: F401
+        import send2trash  # noqa: F401
+        from PySide6 import QtCore, QtWidgets  # noqa: F401
+        _ = _sps.butter
+        _ = _sps.filtfilt
+        _ = _sps.hilbert
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(
+                    f"selftest OK numpy={_np.__version__} "
+                    f"scipy={_sp.__version__} librosa={_lb.__version__}\n"
+                )
+        except Exception:
+            pass
+        return 0
+    except Exception:
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("selftest FAILED\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            traceback.print_exc()
+        return 1
+
+
 def main():
+    if "--selftest" in sys.argv:
+        sys.exit(_run_selftest())
     add_ffmpeg_to_path()
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
