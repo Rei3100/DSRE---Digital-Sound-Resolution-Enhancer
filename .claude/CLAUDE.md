@@ -7,19 +7,30 @@
 
 ## 由来・フォーク事情
 - 本家: [x1aoqv/DSRE---Digital-Sound-Resolution-Enhancer](https://github.com/x1aoqv/DSRE---Digital-Sound-Resolution-Enhancer) (507 行)
-- このフォーク: [Rei3100/DSRE---Digital-Sound-Resolution-Enhancer](https://github.com/Rei3100/DSRE---Digital-Sound-Resolution-Enhancer) (ChatGPT で凝縮済み、現在約 300 行)
-- 参考 (別派生 v2.0): [Urabewe/DSRE v2.0 Enhanced](https://github.com/Urabewe/DSRE---Digital-Sound-Resolution-Enhancer-English) (2000 行超、UI 改善・リトライ等のみ参考)
-- **音質は本家の zansei_impl が好み** → 音響処理ロジック (freq_shift_*, zansei_impl, safe_butter) は**触らない**
-- v2.0 の psychoacoustic_enhancer / multiband_exciter は**取り込まない** (音が変わるため)
+- このフォーク: [Rei3100/DSRE---Digital-Sound-Resolution-Enhancer](https://github.com/Rei3100/DSRE---Digital-Sound-Resolution-Enhancer) (ChatGPT で凝縮後、v1.4 で ~700 行)
+- 参考 (別派生 v2.0): [Urabewe/DSRE v2.0 Enhanced](https://github.com/Urabewe/DSRE---Digital-Sound-Resolution-Enhancer-English) (2000 行超、UI 改善・負荷選択・リトライ等のアイデア参考)
+- **DSRE 系 GitHub 実装の参考は上記 2 つ**。音響概念・信号処理理論・他分野の音質記事は制限なし (詳細は `~/.claude/CLAUDE.md` の「参考元の範囲」節)
+- 音質は本家 zansei_impl の方向性を基準に、**劣化させない改善は積極的に採用**
+- v2.0 の psychoacoustic_enhancer / multiband_exciter も**客観検証を通せば採用可能** (v1.4 以降)
 
-## 絶対ルール
-1. **UI ノータッチ**: `MainWindow` クラスのウィジェット構成・レイアウト・ボタン名 (「開始」「一時停止」「取消」)・setWindowTitle・resize(320, 180) は**1 文字も変えない**
-2. **音響処理ロジック温存**: `zansei_impl`, `freq_shift_mono/multi`, `safe_butter` の計算式は改変禁止 (リファクタで名前変更しただけの等価変換のみ OK)
+## 絶対ルール (2026-04-24 改訂、v1.4 以降)
+1. **UI 最低限の維持 + 改善歓迎**: ボタン名「開始」「一時停止」「取消」は維持、`setWindowTitle("DSRE")` は維持。負荷選択・システムトレイ・アイコン表示等の**機能拡張は可**。resize 値は内容に応じて調整可 (v1.4 は 340x210)
+2. **音響処理は改善歓迎**: `zansei_impl` / `freq_shift_mono/multi` / `safe_butter`(→`safe_butter_sos`) の**計算式を変えて良い**。条件は「劣化させない」のみ (ノイズ・エコー・リバーブ感が増えない、全体として劣化と感じない)。変更時は selftest に客観検証 (数値等価性 / spectral diff / peak shift) を組込、verdict=DEGRADED なら commit しない
 3. **本家影響ゼロ**: `git remote` は `origin` (Rei3100/DSRE) のみ。**`upstream` remote を絶対に追加しない**。本家への PR/push は永久禁止
 4. **`run_hidden` は `CREATE_NO_WINDOW` 単独で使う** (STARTUPINFO は不要、yt-dlp GUI v17.2 と揃える)
 5. **Windows subprocess**: 必ず `creationflags=CREATE_NO_WINDOW`、コマンドプロンプトをポップさせない
 6. **INPUT_DIR / OUTPUT_DIR はハードコード維持** (個人ワークフローで固定、UI から変更させない方針)
-7. **新機能は別セッションで plan → 承認 → 実装**。今のスコープはリファクタ + バグ修正のみ
+7. **新機能は plan → 承認 → 実装**。plan 冒頭に Claude Code 育成 9 項目テーブルを付けること
+
+## 音響処理改善ルール (v1.4 以降)
+- ユーザーは最終の foobar2000 実聴確認のみ。**仮説・実装・客観検証は Claude が完結**
+- 変更時に selftest で必ず以下を計測:
+  - 旧実装との数値差 (max_abs_diff, rms_diff)
+  - スペクトル差 (bin あたりの dB 差)
+  - 波形ピーク移動量
+  - 3 負荷レベルでの determinism (同一入力で同一出力)
+- `verdict: EQUIV / IMPROVED / DEGRADED` を判定しログ出力。DEGRADED は CI で exit 1
+- 指標ライブラリ (pyloudnorm 等) を**社内検証に使うのは自由**、出荷物に含めるかは都度判断
 
 ## 定数中央集約 (ファイル冒頭)
 - `INPUT_DIR` / `OUTPUT_DIR`
