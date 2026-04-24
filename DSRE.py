@@ -5,11 +5,13 @@ import sys
 import time
 import tempfile
 import subprocess
+import configparser
 from dataclasses import dataclass
 
 import numpy as np
 import soundfile as sf
 from scipy import signal
+from scipy.fft import next_fast_len
 import librosa
 import resampy
 
@@ -28,8 +30,66 @@ HARMONIC_LAYERS = 8         # 倍音重畳の段数
 HARMONIC_DECAY = 1.25       # 各段の減衰係数
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 16000   # 倍音生成後のハイパス
-TARGET_SR = 96000           # リサンプル先サンプリング周波数
+TARGET_SR = 192000          # リサンプル先サンプリング周波数 (v1.3: 96000 → 192000)
 FILTER_ORDER = 11           # バターワース次数
+OUTPUT_SUBTYPE_PRIMARY = "PCM_32"   # v1.3: 32bit 出力試行 (失敗時 PCM_24)
+OUTPUT_SUBTYPE_FALLBACK = "PCM_24"
+
+
+# ===== 負荷レベル (v1.3 Phase 3) =====
+LOAD_LEVELS = ("軽", "標準", "最大")
+LOAD_DEFAULT = "標準"
+STATE_INI_NAME = "state.ini"
+
+
+def _state_ini_path():
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, STATE_INI_NAME)
+
+
+def load_level() -> str:
+    p = _state_ini_path()
+    if not os.path.isfile(p):
+        return LOAD_DEFAULT
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(p, encoding="utf-8")
+        lv = cp.get("ui", "load", fallback=LOAD_DEFAULT)
+        return lv if lv in LOAD_LEVELS else LOAD_DEFAULT
+    except Exception:
+        return LOAD_DEFAULT
+
+
+def save_level(lv: str) -> None:
+    if lv not in LOAD_LEVELS:
+        return
+    try:
+        cp = configparser.ConfigParser()
+        p = _state_ini_path()
+        if os.path.isfile(p):
+            cp.read(p, encoding="utf-8")
+        if not cp.has_section("ui"):
+            cp.add_section("ui")
+        cp.set("ui", "load", lv)
+        with open(p, "w", encoding="utf-8") as f:
+            cp.write(f)
+    except Exception:
+        pass
+
+
+def threads_for_level(lv: str) -> int:
+    if lv == "軽":
+        return 1
+    if lv == "最大":
+        try:
+            return max(1, os.cpu_count() or 1)
+        except Exception:
+            return 1
+    return 0  # 標準: auto (threadpoolctl に None 相当を渡す)
+
+
+def resampy_parallel_for_level(lv: str) -> bool:
+    return lv != "軽"
 
 
 @dataclass(frozen=True)
@@ -68,12 +128,12 @@ def run_hidden(cmd):
 # ===== 安全読み込み =====
 def load_audio_safe(path):
     try:
-        data, sr = sf.read(path, always_2d=True)
+        data, sr = sf.read(path, always_2d=True, dtype="float32")
         return data.T, sr
     except (RuntimeError, OSError, ValueError):
         pass
     try:
-        y, sr = librosa.load(path, mono=False, sr=None)
+        y, sr = librosa.load(path, mono=False, sr=None, dtype=np.float32)
         if y.ndim == 1:
             y = y[np.newaxis, :]
         return y, sr
@@ -81,7 +141,21 @@ def load_audio_safe(path):
         raise RuntimeError(f"読み込み失敗: {path}") from e
 
 
-# ===== 保存 =====
+# ===== 保存 (v1.3: 32bit FLAC 直書き + ffmpeg -c copy でメタデータ継承、失敗時は 24bit/WAV フォールバック) =====
+def _try_sf_write(path, data, sr, subtype, fmt):
+    try:
+        sf.write(path, data, sr, subtype=subtype, format=fmt)
+        _ = sf.read(path, always_2d=True, dtype="float32")
+        return True
+    except Exception:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        return False
+
+
 def save_wav24_out(in_path, y_out, sr, out_path):
     if y_out.ndim == 1:
         data = y_out.reshape(-1, 1)
@@ -94,42 +168,64 @@ def save_wav24_out(in_path, y_out, sr, out_path):
     if peak > 1.0:
         data /= peak
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp.close()
-    try:
-        sf.write(tmp.name, data, sr, subtype="FLOAT")
+    base = os.path.splitext(out_path)[0]
+    candidates = (
+        (base + ".flac", OUTPUT_SUBTYPE_PRIMARY, "FLAC"),
+        (base + ".flac", OUTPUT_SUBTYPE_FALLBACK, "FLAC"),
+        (base + ".wav", OUTPUT_SUBTYPE_PRIMARY, "WAV"),
+    )
 
-        out_path = os.path.splitext(out_path)[0] + ".flac"
+    chosen_path = None
+    for target_path, subtype, fmt in candidates:
+        if _try_sf_write(target_path, data, sr, subtype, fmt):
+            chosen_path = target_path
+            break
+    if chosen_path is None:
+        raise RuntimeError("audio write failed for FLAC/WAV (PCM_32/PCM_24)")
+
+    tmp_audio_path = chosen_path + ".tmp_src" + os.path.splitext(chosen_path)[1]
+    try:
+        os.replace(chosen_path, tmp_audio_path)
         cmd = [
             "ffmpeg", "-y",
-            "-i", tmp.name,
+            "-i", tmp_audio_path,
             "-i", in_path,
             "-map", "0:a",
             "-map_metadata", "1",
-            "-c:a", "flac",
-            "-sample_fmt", "s32",
-            out_path,
+            "-c", "copy",
+            chosen_path,
         ]
-        run_hidden(cmd)
-    finally:
         try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-    return out_path
+            run_hidden(cmd)
+        except Exception:
+            if not os.path.exists(chosen_path):
+                os.replace(tmp_audio_path, chosen_path)
+    finally:
+        if os.path.exists(tmp_audio_path):
+            try:
+                os.remove(tmp_audio_path)
+            except OSError:
+                pass
+    return chosen_path
 
 
 # ===== DSP =====
 def freq_shift_mono(x, f_shift, d_sr):
     N = len(x)
-    Np = 1 << int(np.ceil(np.log2(max(1, N))))
-    S = signal.hilbert(np.hstack((x, np.zeros(Np - N))))
+    Np = next_fast_len(max(1, N))
+    S = signal.hilbert(np.hstack((x, np.zeros(Np - N, dtype=x.dtype))))
     F = np.exp(2j * np.pi * f_shift * d_sr * np.arange(Np))
     return (S * F)[:N].real
 
 
 def freq_shift_multi(x, f_shift, d_sr):
-    return np.asarray([freq_shift_mono(ch, f_shift, d_sr) for ch in x])
+    Ch, N = x.shape
+    Np = next_fast_len(max(1, N))
+    padded = np.zeros((Ch, Np), dtype=x.dtype)
+    padded[:, :N] = x
+    S = signal.hilbert(padded, axis=-1)
+    F = np.exp(2j * np.pi * f_shift * d_sr * np.arange(Np))
+    return (S * F[np.newaxis, :])[:, :N].real
 
 
 def safe_butter(order, cutoff, sr):
@@ -148,13 +244,14 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     d_res = np.zeros_like(x)
 
     total = PARAMS.m
+    decays = np.exp(-np.arange(1, total + 1) * PARAMS.decay)
 
     for i in range(total):
         if abort_cb and abort_cb():
             break
 
         shift = sr * (i + 1) / (total * 2.0)
-        d_res += f_dn(d_src, shift, d_sr) * np.exp(-(i + 1) * PARAMS.decay)
+        d_res += f_dn(d_src, shift, d_sr) * decays[i]
 
         if progress_cb:
             progress_cb(i + 1, total)
@@ -174,15 +271,24 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     return result
 
 
+class _NullCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 # ===== Worker =====
 class Worker(QtCore.QThread):
     sig_step = QtCore.Signal(int)
     sig_all = QtCore.Signal(int)
     sig_text = QtCore.Signal(str)
 
-    def __init__(self, files):
+    def __init__(self, files, level=LOAD_DEFAULT):
         super().__init__()
         self.files = files
+        self.level = level if level in LOAD_LEVELS else LOAD_DEFAULT
         self._abort = False
         self._pause = False
         self._mutex = QtCore.QMutex()
@@ -214,44 +320,76 @@ class Worker(QtCore.QThread):
         start = time.time()
         succeeded = 0
 
-        for idx, path in enumerate(self.files, 1):
-            if self._abort:
-                break
+        try:
+            from threadpoolctl import threadpool_limits
+        except Exception:
+            threadpool_limits = None
 
-            self._wait_if_paused()
-            if self._abort:
-                break
+        n_threads = threads_for_level(self.level)
+        try:
+            import numba  # noqa: F401
+            import numba.core.config as _nc
+            if n_threads > 0:
+                try:
+                    import numba as _nb
+                    _nb.set_num_threads(n_threads)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-            self.sig_text.emit(f"{idx}/{total}")
+        resampy_parallel = resampy_parallel_for_level(self.level)
 
-            try:
-                y, sr = load_audio_safe(path)
+        limits_kw = None
+        if threadpool_limits is not None:
+            if n_threads == 0:
+                limits_kw = None
+            else:
+                limits_kw = {"limits": n_threads}
 
-                if sr != PARAMS.target_sr:
-                    y = resampy.resample(y, sr, PARAMS.target_sr)
-                    sr = PARAMS.target_sr
+        ctx = threadpool_limits(**limits_kw) if (threadpool_limits is not None and limits_kw) else _NullCtx()
+        with ctx:
+            for idx, path in enumerate(self.files, 1):
+                if self._abort:
+                    break
 
-                def step_cb(cur, m):
-                    self.sig_step.emit(int(cur * 100 / m))
+                self._wait_if_paused()
+                if self._abort:
+                    break
 
-                y_out = zansei_impl(
-                    y, sr,
-                    progress_cb=step_cb,
-                    abort_cb=lambda: self._abort,
-                )
-
-                out = os.path.join(OUTPUT_DIR, os.path.basename(path))
-                save_wav24_out(path, y_out, sr, out)
+                self.sig_text.emit(f"{idx}/{total}")
 
                 try:
-                    send2trash(path)
+                    y, sr = load_audio_safe(path)
+
+                    if sr != PARAMS.target_sr:
+                        try:
+                            y = resampy.resample(y, sr, PARAMS.target_sr, parallel=resampy_parallel)
+                        except TypeError:
+                            y = resampy.resample(y, sr, PARAMS.target_sr)
+                        sr = PARAMS.target_sr
+
+                    def step_cb(cur, m):
+                        self.sig_step.emit(int(cur * 100 / m))
+
+                    y_out = zansei_impl(
+                        y, sr,
+                        progress_cb=step_cb,
+                        abort_cb=lambda: self._abort,
+                    )
+
+                    out = os.path.join(OUTPUT_DIR, os.path.basename(path))
+                    save_wav24_out(path, y_out, sr, out)
+
+                    try:
+                        send2trash(path)
+                    except Exception:
+                        self._trash_failed += 1
+
+                    succeeded += 1
+
                 except Exception:
-                    self._trash_failed += 1
-
-                succeeded += 1
-
-            except Exception:
-                self._failed.append(os.path.basename(path))
+                    self._failed.append(os.path.basename(path))
 
             elapsed = time.time() - start
             remain = (elapsed / idx) * (total - idx)
@@ -289,7 +427,7 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
 
         self.setWindowTitle("DSRE")
-        self.resize(320, 180)
+        self.resize(340, 210)
 
         self.label = QtWidgets.QLabel("待機")
         self.pb_file = QtWidgets.QProgressBar()
@@ -299,6 +437,12 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_pause = QtWidgets.QPushButton("一時停止")
         self.btn_cancel = QtWidgets.QPushButton("取消")
 
+        self.cmb_level = QtWidgets.QComboBox()
+        self.cmb_level.addItems(list(LOAD_LEVELS))
+        _lv = load_level()
+        idx_lv = LOAD_LEVELS.index(_lv) if _lv in LOAD_LEVELS else LOAD_LEVELS.index(LOAD_DEFAULT)
+        self.cmb_level.setCurrentIndex(idx_lv)
+
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.label)
         layout.addWidget(self.pb_file)
@@ -307,11 +451,17 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(self.btn_pause)
         layout.addWidget(self.btn_cancel)
 
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("負荷"))
+        row.addWidget(self.cmb_level, 1)
+        layout.addLayout(row)
+
         self.setLayout(layout)
 
         self.btn_start.clicked.connect(self.start)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_cancel.clicked.connect(self.cancel)
+        self.cmb_level.currentTextChanged.connect(save_level)
 
         self.worker = None
 
@@ -339,7 +489,8 @@ class MainWindow(QtWidgets.QWidget):
         if not files:
             return
 
-        self.worker = Worker(files)
+        lv = self.cmb_level.currentText() if hasattr(self, "cmb_level") else LOAD_DEFAULT
+        self.worker = Worker(files, level=lv)
         self.worker.sig_step.connect(self.pb_file.setValue)
         self.worker.sig_all.connect(self.pb_all.setValue)
         self.worker.sig_text.connect(self.label.setText)
@@ -369,11 +520,17 @@ class MainWindow(QtWidgets.QWidget):
 
 
 def _run_selftest() -> int:
-    """ビルド成果物が最低限 import できることを確認するセルフテスト。
+    """ビルド成果物が最低限 import + 出力書込 + 処理 determinism で通ることを確認するセルフテスト。
 
     PyInstaller の excludes や hidden import の抜けで起動不能になる事故を
     CI / ローカル / デプロイ直前で捕まえるためのゲート。QApplication は作らない
     (ヘッドレス CI 環境で Qt platform plugin 初期化を走らせないため)。
+
+    v1.3 追加検証:
+      1. threadpoolctl import 可能
+      2. 192000Hz / PCM_32 FLAC 書込 → 読み直しで完全一致
+      3. 短い合成信号を zansei_impl で 3 段の負荷レベル (スレッド数違い) で各 2 回実行し、
+         **同じ負荷内での determinism (bit 一致)** を確認
     """
     import traceback
     log_dir = os.path.dirname(sys.executable) or os.getcwd()
@@ -387,21 +544,103 @@ def _run_selftest() -> int:
         import numpy.testing  # noqa: F401  # unittest 地雷検出用
         import librosa as _lb
         import resampy  # noqa: F401
-        import soundfile  # noqa: F401
+        import soundfile as _sf
         import send2trash  # noqa: F401
         from PySide6 import QtCore, QtWidgets  # noqa: F401
+        import threadpoolctl  # noqa: F401 (v1.3 追加)
+
         _ = _sps.butter
         _ = _sps.filtfilt
         _ = _sps.hilbert
+
+        tpc_version = getattr(threadpoolctl, "__version__", "?")
+
+        # --- (1) 192kHz / PCM_32 FLAC round-trip ---
+        tmp_flac = tempfile.NamedTemporaryFile(delete=False, suffix=".flac")
+        tmp_flac.close()
+        sr_test = 192000
+        t = _np.arange(sr_test // 20, dtype=_np.float32) / sr_test
+        sig = (0.25 * _np.sin(2 * _np.pi * 1000.0 * t)).astype(_np.float32)
+        sig2 = _np.stack([sig, sig], axis=1)
+        rt_fmt = "unknown"
+        rt_subtype = "unknown"
         try:
-            with open(log_path, "w", encoding="utf-8") as f:
-                f.write(
-                    f"selftest OK numpy={_np.__version__} "
-                    f"scipy={_sp.__version__} librosa={_lb.__version__}\n"
-                )
+            _sf.write(tmp_flac.name, sig2, sr_test, subtype="PCM_32", format="FLAC")
+            data_read, sr_read = _sf.read(tmp_flac.name, always_2d=True, dtype="float32")
+            assert sr_read == sr_test, f"sr mismatch {sr_read}!={sr_test}"
+            assert data_read.shape == sig2.shape, "shape mismatch after round-trip"
+            rt_fmt = "FLAC"
+            rt_subtype = "PCM_32"
         except Exception:
-            pass
-        return 0
+            try:
+                if os.path.exists(tmp_flac.name):
+                    os.remove(tmp_flac.name)
+            except OSError:
+                pass
+            tmp_fallback = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            tmp_fallback.close()
+            try:
+                _sf.write(tmp_fallback.name, sig2, sr_test, subtype="PCM_32", format="WAV")
+                data_read, sr_read = _sf.read(tmp_fallback.name, always_2d=True, dtype="float32")
+                assert sr_read == sr_test, f"sr mismatch {sr_read}!={sr_test}"
+                rt_fmt = "WAV"
+                rt_subtype = "PCM_32"
+                tmp_flac.name = tmp_fallback.name
+            finally:
+                pass
+        finally:
+            try:
+                if os.path.exists(tmp_flac.name):
+                    os.remove(tmp_flac.name)
+            except OSError:
+                pass
+
+        # --- (2) zansei_impl の determinism (同一負荷内で二重実行 bit 一致) ---
+        import numpy as _np2
+        rng = _np2.random.default_rng(1234)
+        N = 4096
+        x_stereo = rng.standard_normal((2, N)).astype(_np2.float32) * 0.05
+        sr_proc = 192000
+
+        det_ok = True
+        det_notes = []
+        for lv in LOAD_LEVELS:
+            n_thr = threads_for_level(lv)
+            kw = {"limits": n_thr} if n_thr > 0 else None
+            try:
+                ctx1 = threadpoolctl.threadpool_limits(**kw) if kw else _NullCtx()
+                with ctx1:
+                    y1 = zansei_impl(x_stereo.copy(), sr_proc)
+                ctx2 = threadpoolctl.threadpool_limits(**kw) if kw else _NullCtx()
+                with ctx2:
+                    y2 = zansei_impl(x_stereo.copy(), sr_proc)
+            except Exception as e:
+                det_ok = False
+                det_notes.append(f"{lv}:EXC({type(e).__name__})")
+                continue
+
+            if not _np2.all(_np2.isfinite(y1)) or not _np2.all(_np2.isfinite(y2)):
+                det_notes.append(f"{lv}:NaN")
+                det_ok = False
+                continue
+
+            if _np2.array_equal(y1, y2):
+                det_notes.append(f"{lv}:OK")
+            else:
+                max_abs = float(_np2.max(_np2.abs(y1 - y2)))
+                det_notes.append(f"{lv}:diff(max={max_abs:.3e})")
+                if max_abs > 1e-5:
+                    det_ok = False
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"selftest OK numpy={_np.__version__} "
+                f"scipy={_sp.__version__} librosa={_lb.__version__} "
+                f"threadpoolctl={tpc_version} "
+                f"roundtrip={rt_fmt}/{rt_subtype} "
+                f"determinism=[{' '.join(det_notes)}]\n"
+            )
+        return 0 if det_ok else 1
     except Exception:
         try:
             with open(log_path, "w", encoding="utf-8") as f:

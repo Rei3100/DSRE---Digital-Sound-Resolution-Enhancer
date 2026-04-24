@@ -5,3 +5,4 @@ librosa==0.11.0
 resampy==0.4.3
 soundfile==0.13.1
 send2trash==1.8.3
+threadpoolctl==3.5.0
