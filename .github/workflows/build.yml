@@ -44,8 +44,28 @@ jobs:
       - name: 依存バージョン記録
         run: pip freeze > build-manifest.txt
 
+      - name: ffmpeg 最新版取得 (BtbN win64 gpl)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extract -Force
+          $ff = Get-ChildItem ffmpeg_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $ff) { throw "ffmpeg.exe not found in BtbN archive" }
+          New-Item -ItemType Directory -Path _ffmpeg -Force | Out-Null
+          Copy-Item $ff.FullName _ffmpeg\ffmpeg.exe
+          & _ffmpeg\ffmpeg.exe -version | Select-Object -First 1
+
       - name: ビルド（spec 経由）
         run: pyinstaller DSRE.spec --clean --noconfirm
+
+      - name: ffmpeg を _internal/ffmpeg に同梱
+        shell: pwsh
+        run: |
+          $dst = "dist\DSRE\_internal\ffmpeg"
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          Copy-Item _ffmpeg\ffmpeg.exe (Join-Path $dst "ffmpeg.exe")
+          if (-not (Test-Path (Join-Path $dst "ffmpeg.exe"))) { throw "ffmpeg not staged" }
 
       - name: スモークテスト（必須依存の同梱確認）
         shell: pwsh
@@ -60,7 +80,7 @@ jobs:
             if (-not (Test-Path $p -PathType Container)) { throw "MISSING dir: $p" }
           }
           # ファイルとして存在すべき単一モジュール依存
-          $files = @("DSRE.exe")
+          $files = @("DSRE.exe", "_internal/ffmpeg/ffmpeg.exe")
           foreach ($r in $files) {
             $p = Join-Path $dist $r
             if (-not (Test-Path $p -PathType Leaf)) { throw "MISSING file: $p" }

@@ -23,12 +23,35 @@ foreach ($d in @("build", "dist", "release")) {
     if (Test-Path $p) { Remove-Item $p -Recurse -Force }
 }
 
+Write-Host "[build] fetch ffmpeg (BtbN win64 gpl, latest)"
+$ffStage = Join-Path $PSScriptRoot "_ffmpeg"
+if (-not (Test-Path (Join-Path $ffStage "ffmpeg.exe"))) {
+    $ffUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+    $ffZip = Join-Path $PSScriptRoot "ffmpeg.zip"
+    $ffExtract = Join-Path $PSScriptRoot "ffmpeg_extract"
+    if (Test-Path $ffExtract) { Remove-Item $ffExtract -Recurse -Force }
+    Invoke-WebRequest -Uri $ffUrl -OutFile $ffZip
+    Expand-Archive -Path $ffZip -DestinationPath $ffExtract -Force
+    $ff = Get-ChildItem $ffExtract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+    if (-not $ff) { throw "ffmpeg.exe not found in BtbN archive" }
+    New-Item -ItemType Directory -Path $ffStage -Force | Out-Null
+    Copy-Item $ff.FullName (Join-Path $ffStage "ffmpeg.exe") -Force
+    Remove-Item $ffZip -Force -ErrorAction SilentlyContinue
+    Remove-Item $ffExtract -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "[build] pyinstaller DSRE.spec"
 & $pyi DSRE.spec --clean --noconfirm
 if ($LASTEXITCODE -ne 0) { throw "pyinstaller failed with exit $LASTEXITCODE" }
 
 $dist = Join-Path $PSScriptRoot "dist\DSRE"
-$required = @("_internal\numpy", "_internal\scipy", "_internal\librosa", "_internal\numba", "_internal\llvmlite", "_internal\resampy", "_internal\soundfile", "DSRE.exe")
+
+Write-Host "[build] stage ffmpeg into _internal/ffmpeg"
+$ffDst = Join-Path $dist "_internal\ffmpeg"
+New-Item -ItemType Directory -Path $ffDst -Force | Out-Null
+Copy-Item (Join-Path $ffStage "ffmpeg.exe") (Join-Path $ffDst "ffmpeg.exe") -Force
+
+$required = @("_internal\numpy", "_internal\scipy", "_internal\librosa", "_internal\numba", "_internal\llvmlite", "_internal\resampy", "_internal\soundfile", "_internal\ffmpeg\ffmpeg.exe", "DSRE.exe")
 foreach ($r in $required) {
     $p = Join-Path $dist $r
     if (-not (Test-Path $p)) { throw "MISSING after build: $p" }

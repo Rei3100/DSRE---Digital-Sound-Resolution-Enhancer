@@ -28,7 +28,7 @@ $ErrorActionPreference = "Stop"
 
 function Assert-Layout {
     param([string]$root)
-    $need = @("DSRE.exe", "_internal\numpy", "_internal\scipy", "_internal\librosa")
+    $need = @("DSRE.exe", "_internal\numpy", "_internal\scipy", "_internal\librosa", "_internal\ffmpeg\ffmpeg.exe")
     foreach ($n in $need) {
         $p = Join-Path $root $n
         if (-not (Test-Path $p)) { throw "MISSING in source: $p" }
