@@ -39,7 +39,7 @@ jobs:
               throw "$f is UTF-16 encoded. pip can't parse it. Re-save as UTF-8."
             }
           }
-          python -c "import numpy, scipy, librosa, soundfile, resampy, send2trash; print('deps installed OK')"
+          python -c "import numpy, scipy, librosa, soundfile, resampy, send2trash, threadpoolctl; print('deps installed OK')"
 
       - name: 依存バージョン記録
         run: pip freeze > build-manifest.txt
