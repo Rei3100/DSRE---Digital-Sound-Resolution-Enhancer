@@ -1,0 +1,11 @@
+dist/
+release/
+build/
+_artifact/
+build-manifest.txt
+*.pyc
+__pycache__/
+*.flac
+*.wav
+*.bak/
+DSRE_private.zip
