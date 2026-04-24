@@ -211,6 +211,13 @@ def save_wav24_out(in_path, y_out, sr, out_path):
 
 # ===== DSP =====
 def freq_shift_mono(x, f_shift, d_sr):
+    """1D 実信号を f_shift [Hz] だけ周波数シフト (single-sideband)。
+
+    解析信号 (hilbert で得た complex signal) に e^{j*2*pi*f*t} を乗じると、
+    数学的に上側サイドバンドのみが残る。最後に `.real` で実部を取るのは、
+    解析信号 z = x + j*H[x] のうち音として復元すべき成分が実部側であるため。
+    `np.abs(..)` では振幅包絡線になってしまい原音と関係ないので誤り。
+    """
     N = len(x)
     Np = next_fast_len(max(1, N))
     S = signal.hilbert(np.hstack((x, np.zeros(Np - N, dtype=x.dtype))))
@@ -219,6 +226,9 @@ def freq_shift_mono(x, f_shift, d_sr):
 
 
 def freq_shift_multi(x, f_shift, d_sr):
+    """マルチチャンネル版 freq_shift_mono。各チャンネル独立に適用。
+    `.real` を取る理由は freq_shift_mono の docstring を参照。
+    """
     Ch, N = x.shape
     Np = next_fast_len(max(1, N))
     padded = np.zeros((Ch, Np), dtype=x.dtype)
@@ -228,16 +238,37 @@ def freq_shift_multi(x, f_shift, d_sr):
     return (S * F[np.newaxis, :])[:, :N].real
 
 
-def safe_butter(order, cutoff, sr):
-    nyq = sr / 2
-    cutoff = min(cutoff, nyq * 0.95)
+def safe_butter_sos(order, cutoff_hz, sr, btype="highpass"):
+    """SOS (Second-Order Sections) 形式で Butterworth を構築する。
+    高次 IIR (本プロジェクトでは order=11) で ba 係数がアンダーフロー / ピボット
+    不安定になるのを避けるため、sosfiltfilt と対で使うこと。
+    """
+    nyq = sr / 2.0
+    cutoff_hz = min(cutoff_hz, nyq * 0.95)
     order = min(order, 20)
-    return signal.butter(order, cutoff / nyq, 'highpass')
+    wn = max(1e-6, min(0.999, cutoff_hz / nyq))
+    return signal.butter(order, wn, btype=btype, output="sos")
+
+
+def safe_sosfiltfilt(sos, x, axis=-1):
+    """sosfiltfilt のガード付きラッパ。
+    理論上 sosfiltfilt は filtfilt(ba) より数値安定で NaN が出にくいが、
+    極端な低 Wn の高次 IIR では浮動小数誤差が蓄積しうるためフェイルセーフを張る。
+    例外 / NaN / Inf のいずれが出ても入力を [-1, 1] に clip して返す。
+    """
+    try:
+        y = signal.sosfiltfilt(sos, x, axis=axis)
+    except Exception:
+        return np.clip(x, -1.0, 1.0)
+    if not np.all(np.isfinite(y)):
+        return np.clip(x, -1.0, 1.0)
+    return y
 
 
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
-    b, a = safe_butter(PARAMS.filter_order, PARAMS.pre_hp, sr)
-    d_src = signal.filtfilt(b, a, x)
+    # 倍音抽出用 pre-HP (3kHz 以上を倍音生成素材に使う、SOS で数値安定化)
+    sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
+    d_src = safe_sosfiltfilt(sos_pre, x, axis=-1)
 
     d_sr = 1.0 / sr
     f_dn = freq_shift_mono if (x.ndim == 1) else freq_shift_multi
@@ -245,19 +276,28 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
 
     total = PARAMS.m
     decays = np.exp(-np.arange(1, total + 1) * PARAMS.decay)
+    nyq = sr / 2.0
 
     for i in range(total):
         if abort_cb and abort_cb():
             break
 
         shift = sr * (i + 1) / (total * 2.0)
+        # ナイキスト到達/超過のシフト層はスキップ (折り返しアーティファクト防止)。
+        # 現パラメータ (total=8, sr=192000) では最大 shift=96000=nyq なので最終層のみスキップ。
+        if shift >= nyq:
+            if progress_cb:
+                progress_cb(i + 1, total)
+            continue
+
         d_res += f_dn(d_src, shift, d_sr) * decays[i]
 
         if progress_cb:
             progress_cb(i + 1, total)
 
-    b, a = safe_butter(PARAMS.filter_order, PARAMS.post_hp, sr)
-    d_res = signal.filtfilt(b, a, d_res)
+    # 生成した倍音の低域を再度カット (16kHz 以上の高域のみに寄与、SOS で数値安定化)
+    sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
+    d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
     adp = float(np.mean(np.abs(d_res)))
     src = float(np.mean(np.abs(x)))
