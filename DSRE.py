@@ -15,7 +15,7 @@ from scipy.fft import next_fast_len
 import librosa
 import resampy
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from send2trash import send2trash
 
@@ -108,12 +108,48 @@ class DSREParams:
 PARAMS = DSREParams()
 
 
-# ===== ffmpeg PATH 補完（同梱 ffmpeg/ffmpeg.exe があれば追加）=====
+# ===== バンドルリソースのパス解決 =====
+def _resource_base_dirs() -> tuple[str, ...]:
+    """PyInstaller onedir / 開発実行の両方で同梱リソースを探すためのベースディレクトリ群。"""
+    dirs: list[str] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(meipass)
+    if getattr(sys, "frozen", False):
+        dirs.append(os.path.dirname(os.path.abspath(sys.executable)))
+    else:
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    return tuple(dirs)
+
+
+def _find_bundled(*relative_paths: str) -> str | None:
+    """いずれかのベース + 相対パスの組合せで最初に見つかった絶対パスを返す。"""
+    for base in _resource_base_dirs():
+        for rel in relative_paths:
+            p = os.path.join(base, rel)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+# ===== ffmpeg PATH 補完 (同梱 ffmpeg/ffmpeg.exe または _internal/ffmpeg/ffmpeg.exe を探索) =====
 def add_ffmpeg_to_path() -> None:
-    here = os.path.dirname(os.path.abspath(__file__))
-    bundled = os.path.join(here, "ffmpeg", "ffmpeg.exe")
-    if os.path.isfile(bundled):
+    bundled = _find_bundled(
+        os.path.join("ffmpeg", "ffmpeg.exe"),
+        os.path.join("_internal", "ffmpeg", "ffmpeg.exe"),
+    )
+    if bundled:
         os.environ["PATH"] = os.path.dirname(bundled) + os.pathsep + os.environ.get("PATH", "")
+
+
+# ===== アプリアイコン (logo.ico) =====
+def _logo_path() -> str | None:
+    return _find_bundled("logo.ico")
+
+
+def _app_icon() -> "QtGui.QIcon":
+    p = _logo_path()
+    return QtGui.QIcon(p) if p else QtGui.QIcon()
 
 
 # ===== subprocess 起動（コマンドプロンプト非表示）=====
@@ -471,12 +507,13 @@ class Worker(QtCore.QThread):
             self.sig_text.emit(f"完了  {succeeded}/{total}")
 
 
-# ===== UI（表示・レイアウトは変更なし、動作のみ堅牢化）=====
+# ===== UI (v1.4: トレイ常駐 + 負荷サブメニュー + logo.ico + × 即終了) =====
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("DSRE")
+        self.setWindowIcon(_app_icon())
         self.resize(340, 210)
 
         self.label = QtWidgets.QLabel("待機")
@@ -511,10 +548,94 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_start.clicked.connect(self.start)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_cancel.clicked.connect(self.cancel)
-        self.cmb_level.currentTextChanged.connect(save_level)
+        # 負荷 ComboBox → _set_load_level で保存 + トレイ側と同期
+        self.cmb_level.currentTextChanged.connect(self._set_load_level)
 
         self.worker = None
+        self._tray = None
+        self._load_actions: dict[str, QtGui.QAction] = {}
+        self._setup_tray()
 
+    # ---- トレイ ----
+    def _setup_tray(self) -> None:
+        """システムトレイアイコン + 右クリックメニュー (開始/一時停止/取消/負荷サブメニュー/終了) を構築。"""
+        if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self._tray = QtWidgets.QSystemTrayIcon(self)
+        self._tray.setIcon(_app_icon())
+        self._tray.setToolTip("DSRE")
+
+        menu = QtWidgets.QMenu()
+        act_show = menu.addAction("表示")
+        act_show.triggered.connect(self._show_from_tray)
+        menu.addSeparator()
+
+        menu.addAction("開始", self.start)
+        menu.addAction("一時停止", self.pause)
+        menu.addAction("取消", self.cancel)
+        menu.addSeparator()
+
+        # 負荷サブメニュー (排他ラジオ)
+        sub = menu.addMenu("負荷")
+        group = QtGui.QActionGroup(self)
+        group.setExclusive(True)
+        current = self.cmb_level.currentText()
+        for lv in LOAD_LEVELS:
+            act = QtGui.QAction(lv, self, checkable=True)
+            act.setChecked(lv == current)
+            act.triggered.connect(lambda _checked=False, name=lv: self._set_load_level(name))
+            group.addAction(act)
+            sub.addAction(act)
+            self._load_actions[lv] = act
+        self._load_action_group = group  # GC 防止のため保持
+
+        menu.addSeparator()
+        menu.addAction("終了", self._quit_app)
+
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray)
+        self._tray.show()
+
+    def _set_load_level(self, lv: str) -> None:
+        """UI コンボ / トレイサブメニューどちらから呼ばれても、双方と state.ini を同期する。"""
+        if lv not in LOAD_LEVELS:
+            return
+        save_level(lv)
+        # コンボ側を signal 循環なしで同期
+        if hasattr(self, "cmb_level") and self.cmb_level.currentText() != lv:
+            self.cmb_level.blockSignals(True)
+            try:
+                self.cmb_level.setCurrentText(lv)
+            finally:
+                self.cmb_level.blockSignals(False)
+        # トレイ側のチェック状態を同期
+        for name, act in self._load_actions.items():
+            act.setChecked(name == lv)
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray(self, reason) -> None:
+        # 左クリックでウィンドウの表示/非表示をトグル
+        if reason == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible() and self.isActiveWindow():
+                self.hide()
+            else:
+                self._show_from_tray()
+
+    def _quit_app(self) -> None:
+        """トレイ「終了」および × ボタン共通の終了処理。確認ダイアログなし (ユーザー要望)。"""
+        if self.worker and self.worker.isRunning():
+            self.worker.abort()
+            self.worker.wait(3000)
+        if self._tray is not None:
+            self._tray.hide()
+        QtWidgets.QApplication.instance().quit()
+
+    # ---- ファイル処理 ----
     def load_files(self):
         files = []
 
@@ -554,18 +675,20 @@ class MainWindow(QtWidgets.QWidget):
         if self.worker:
             self.worker.abort()
 
-    def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            ret = QtWidgets.QMessageBox.question(
-                self, "DSRE", "処理中です。終了しますか？",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No,
-            )
-            if ret != QtWidgets.QMessageBox.Yes:
+    # ---- ウィンドウイベント (最小化→トレイ隠蔽、× で即終了) ----
+    def changeEvent(self, event):
+        # 最小化はトレイに隠蔽 (タスクバーから消す)
+        if event.type() == QtCore.QEvent.Type.WindowStateChange:
+            if self.isMinimized() and self._tray is not None:
                 event.ignore()
+                # QTimer.singleShot で hide を遅延させないと状態変化中で無視されることがある
+                QtCore.QTimer.singleShot(0, self.hide)
                 return
-            self.worker.abort()
-            self.worker.wait(3000)
+        super().changeEvent(event)
+
+    def closeEvent(self, event):
+        # × = 即終了 (確認ダイアログなし、処理中であれば abort + 3 秒待機)
+        self._quit_app()
         event.accept()
 
 
@@ -709,6 +832,9 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(_app_icon())
+    # トレイ運用: 最後のウィンドウが閉じてもアプリを終了させない
+    app.setQuitOnLastWindowClosed(False)
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
