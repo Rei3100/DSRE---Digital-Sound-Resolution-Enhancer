@@ -30,10 +30,11 @@ HARMONIC_LAYERS = 8         # 倍音重畳の段数
 HARMONIC_DECAY = 1.25       # 各段の減衰係数
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 16000   # 倍音生成後のハイパス
-TARGET_SR = 192000          # リサンプル先サンプリング周波数 (v1.3: 96000 → 192000)
+TARGET_SR = 192000          # リサンプル先サンプリング周波数 (192 kHz)
 FILTER_ORDER = 11           # バターワース次数
-OUTPUT_SUBTYPE_PRIMARY = "PCM_32"   # v1.3: 32bit 出力試行 (失敗時 PCM_24)
-OUTPUT_SUBTYPE_FALLBACK = "PCM_24"
+OUTPUT_SUBTYPE = "FLOAT"    # v1.4: 32-bit IEEE float WAV (libsndfile 完全対応、量子化ノイズ消滅)
+OUTPUT_FORMAT = "WAV"
+OUTPUT_EXT = ".wav"
 
 
 # ===== 負荷レベル (v1.3 Phase 3) =====
@@ -100,7 +101,8 @@ class DSREParams:
     post_hp: int = POST_HP_CUTOFF_HZ
     target_sr: int = TARGET_SR
     filter_order: int = FILTER_ORDER
-    format: str = "FLAC"
+    output_format: str = "WAV"
+    output_subtype: str = "FLOAT"
 
 
 PARAMS = DSREParams()
@@ -141,11 +143,15 @@ def load_audio_safe(path):
         raise RuntimeError(f"読み込み失敗: {path}") from e
 
 
-# ===== 保存 (v1.3: 32bit FLAC 直書き + ffmpeg -c copy でメタデータ継承、失敗時は 24bit/WAV フォールバック) =====
+# ===== 保存 (v1.4: 192kHz / 32-bit IEEE float WAV + ffmpeg -c copy でメタデータ継承) =====
 def _try_sf_write(path, data, sr, subtype, fmt):
+    """書込 → 読み直しで shape / sr が一致するかをラウンドトリップ検証する。
+    失敗時は中途半端に残ったファイルを削除して False を返す。"""
     try:
         sf.write(path, data, sr, subtype=subtype, format=fmt)
-        _ = sf.read(path, always_2d=True, dtype="float32")
+        check, check_sr = sf.read(path, always_2d=True, dtype="float32")
+        if check_sr != sr or check.shape != data.shape:
+            raise RuntimeError("roundtrip mismatch")
         return True
     except Exception:
         try:
@@ -156,57 +162,61 @@ def _try_sf_write(path, data, sr, subtype, fmt):
         return False
 
 
-def save_wav24_out(in_path, y_out, sr, out_path):
+def save_wav32float_out(in_path, y_out, sr, out_path):
+    """DSP 結果を 32-bit IEEE float WAV として書き出し、ffmpeg でメタデータを継承する。
+
+    - 32-bit float WAV (subtype="FLOAT", format="WAV") は libsndfile 完全対応、
+      foobar2000 では "32-bit floating-point" と表示される
+    - 32-bit float の動的レンジは実用上無限 (clipping 量子化ノイズ皆無)
+    - 再生機器側の入力段で >1.0 を嫌うケースに備え、peak>0.99 のときは
+      -1dBFS 相当に緩くスケールダウンする
+    - メタデータ継承は ffmpeg `-map_metadata 1 -c copy -write_id3v2 1` で実施。
+      入力が FLAC (Vorbis Comment) でも WAV (LIST/INFO) でも、タグが自動変換される。
+    """
     if y_out.ndim == 1:
         data = y_out.reshape(-1, 1)
     else:
         data = y_out.T
-
     data = data.astype(np.float32, copy=False)
 
     peak = float(np.max(np.abs(data))) if data.size else 0.0
-    if peak > 1.0:
-        data /= peak
+    if peak > 0.99:
+        data = data * (0.99 / peak)
 
     base = os.path.splitext(out_path)[0]
-    candidates = (
-        (base + ".flac", OUTPUT_SUBTYPE_PRIMARY, "FLAC"),
-        (base + ".flac", OUTPUT_SUBTYPE_FALLBACK, "FLAC"),
-        (base + ".wav", OUTPUT_SUBTYPE_PRIMARY, "WAV"),
-    )
+    final_path = base + OUTPUT_EXT
 
-    chosen_path = None
-    for target_path, subtype, fmt in candidates:
-        if _try_sf_write(target_path, data, sr, subtype, fmt):
-            chosen_path = target_path
-            break
-    if chosen_path is None:
-        raise RuntimeError("audio write failed for FLAC/WAV (PCM_32/PCM_24)")
+    # 一時 WAV に書込 (メタデータ無し)
+    tmp_path = final_path + ".tmp_src.wav"
+    if not _try_sf_write(tmp_path, data, sr, OUTPUT_SUBTYPE, OUTPUT_FORMAT):
+        raise RuntimeError(f"WAV FLOAT 書込失敗: {final_path}")
 
-    tmp_audio_path = chosen_path + ".tmp_src" + os.path.splitext(chosen_path)[1]
+    # ffmpeg でメタデータ継承 (音声は -c copy で再エンコード無し = 完全無劣化)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", tmp_path,     # 音声ソース (DSP 済 WAV FLOAT)
+        "-i", in_path,      # メタデータソース (元 FLAC 等)
+        "-map", "0:a",
+        "-map_metadata", "1",
+        "-c", "copy",
+        "-write_id3v2", "1",  # WAV にも ID3v2 チャンクを書く
+        final_path,
+    ]
     try:
-        os.replace(chosen_path, tmp_audio_path)
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", tmp_audio_path,
-            "-i", in_path,
-            "-map", "0:a",
-            "-map_metadata", "1",
-            "-c", "copy",
-            chosen_path,
-        ]
+        run_hidden(cmd)
         try:
-            run_hidden(cmd)
-        except Exception:
-            if not os.path.exists(chosen_path):
-                os.replace(tmp_audio_path, chosen_path)
-    finally:
-        if os.path.exists(tmp_audio_path):
-            try:
-                os.remove(tmp_audio_path)
-            except OSError:
-                pass
-    return chosen_path
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    except Exception:
+        # ffmpeg 失敗時はメタ無しで確定 (音声は確保されている)
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            os.replace(tmp_path, final_path)
+        except OSError:
+            pass
+    return final_path
 
 
 # ===== DSP =====
@@ -419,7 +429,7 @@ class Worker(QtCore.QThread):
                     )
 
                     out = os.path.join(OUTPUT_DIR, os.path.basename(path))
-                    save_wav24_out(path, y_out, sr, out)
+                    save_wav32float_out(path, y_out, sr, out)
 
                     try:
                         send2trash(path)
