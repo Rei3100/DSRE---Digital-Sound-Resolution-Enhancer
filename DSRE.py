@@ -693,22 +693,26 @@ class MainWindow(QtWidgets.QWidget):
 
 
 def _run_selftest() -> int:
-    """ビルド成果物が最低限 import + 出力書込 + 処理 determinism で通ることを確認するセルフテスト。
+    """v1.4 自走品質ループ: import + WAV FLOAT roundtrip + sosfiltfilt 等価性 + 3 負荷 determinism + ffmpeg 同梱確認。
 
-    PyInstaller の excludes や hidden import の抜けで起動不能になる事故を
-    CI / ローカル / デプロイ直前で捕まえるためのゲート。QApplication は作らない
-    (ヘッドレス CI 環境で Qt platform plugin 初期化を走らせないため)。
+    Claude が「音響処理を改善しても劣化していない」ことを数値で判定するためのゲート。
+    verdict が DEGRADED のときは exit 1 → CI / build.ps1 / deploy.ps1 が artifact を作らない。
+    QApplication は作らない (ヘッドレス環境で Qt platform plugin を走らせない)。
 
-    v1.3 追加検証:
-      1. threadpoolctl import 可能
-      2. 192000Hz / PCM_32 FLAC 書込 → 読み直しで完全一致
-      3. 短い合成信号を zansei_impl で 3 段の負荷レベル (スレッド数違い) で各 2 回実行し、
-         **同じ負荷内での determinism (bit 一致)** を確認
+    検査層:
+      (1) 必須 import (numpy/scipy/librosa/resampy/soundfile/send2trash/PySide6/threadpoolctl)
+      (2) WAV 192 kHz / 32bit-float (IEEE float) roundtrip: shape + sr 一致 + 量子化誤差 ~0
+      (3) sosfiltfilt 等価性: 旧 filtfilt(ba) と新 sosfiltfilt(sos) で low Wn 11 次
+          Butterworth を回し、max_abs_diff < 1e-4 / rms_diff / rms_ref < 1e-5 を確認
+          (旧が NaN を吐き新が有限値のときは IMPROVED)
+      (4) 3 負荷 determinism: 同一入力 × 同一負荷で 2 回実行し bit 一致
+      (5) 同梱 ffmpeg の存在確認 (ビルド成果物でのみ意味がある、開発時はスキップ可)
     """
     import traceback
     log_dir = os.path.dirname(sys.executable) or os.getcwd()
     log_path = os.path.join(log_dir, "selftest.log")
     try:
+        # ---- (1) imports ----
         import numpy as _np
         import scipy as _sp
         import scipy.signal as _sps
@@ -720,63 +724,106 @@ def _run_selftest() -> int:
         import soundfile as _sf
         import send2trash  # noqa: F401
         from PySide6 import QtCore, QtWidgets  # noqa: F401
-        import threadpoolctl  # noqa: F401 (v1.3 追加)
+        import threadpoolctl  # noqa: F401
 
         _ = _sps.butter
         _ = _sps.filtfilt
+        _ = _sps.sosfiltfilt
         _ = _sps.hilbert
 
         tpc_version = getattr(threadpoolctl, "__version__", "?")
+        notes: list[str] = []
+        verdict = "EQUIV"
 
-        # --- (1) 192kHz / PCM_32 FLAC round-trip ---
-        tmp_flac = tempfile.NamedTemporaryFile(delete=False, suffix=".flac")
-        tmp_flac.close()
+        # ---- (2) WAV 192 kHz / FLOAT roundtrip ----
         sr_test = 192000
         t = _np.arange(sr_test // 20, dtype=_np.float32) / sr_test
-        sig = (0.25 * _np.sin(2 * _np.pi * 1000.0 * t)).astype(_np.float32)
-        sig2 = _np.stack([sig, sig], axis=1)
-        rt_fmt = "unknown"
-        rt_subtype = "unknown"
+        sig_mono = (0.25 * _np.sin(2 * _np.pi * 1000.0 * t)).astype(_np.float32)
+        sig_stereo = _np.stack([sig_mono, sig_mono], axis=1)
+
+        rt_max_abs = float("nan")
+        rt_status = "FAIL"
+        tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp_wav.close()
         try:
-            _sf.write(tmp_flac.name, sig2, sr_test, subtype="PCM_32", format="FLAC")
-            data_read, sr_read = _sf.read(tmp_flac.name, always_2d=True, dtype="float32")
+            _sf.write(tmp_wav.name, sig_stereo, sr_test, subtype=OUTPUT_SUBTYPE, format=OUTPUT_FORMAT)
+            data_read, sr_read = _sf.read(tmp_wav.name, always_2d=True, dtype="float32")
             assert sr_read == sr_test, f"sr mismatch {sr_read}!={sr_test}"
-            assert data_read.shape == sig2.shape, "shape mismatch after round-trip"
-            rt_fmt = "FLAC"
-            rt_subtype = "PCM_32"
-        except Exception:
-            try:
-                if os.path.exists(tmp_flac.name):
-                    os.remove(tmp_flac.name)
-            except OSError:
-                pass
-            tmp_fallback = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-            tmp_fallback.close()
-            try:
-                _sf.write(tmp_fallback.name, sig2, sr_test, subtype="PCM_32", format="WAV")
-                data_read, sr_read = _sf.read(tmp_fallback.name, always_2d=True, dtype="float32")
-                assert sr_read == sr_test, f"sr mismatch {sr_read}!={sr_test}"
-                rt_fmt = "WAV"
-                rt_subtype = "PCM_32"
-                tmp_flac.name = tmp_fallback.name
-            finally:
-                pass
+            assert data_read.shape == sig_stereo.shape, "shape mismatch after round-trip"
+            rt_max_abs = float(_np.max(_np.abs(data_read - sig_stereo)))
+            # PCM_FLOAT は bit-exact 近い (量子化ノイズなし、IEEE float の丸めのみ)
+            rt_status = "OK" if rt_max_abs < 1e-6 else f"LOSSY({rt_max_abs:.2e})"
+            if rt_max_abs >= 1e-6:
+                verdict = "DEGRADED"
         finally:
             try:
-                if os.path.exists(tmp_flac.name):
-                    os.remove(tmp_flac.name)
+                if os.path.exists(tmp_wav.name):
+                    os.remove(tmp_wav.name)
             except OSError:
                 pass
 
-        # --- (2) zansei_impl の determinism (同一負荷内で二重実行 bit 一致) ---
-        import numpy as _np2
-        rng = _np2.random.default_rng(1234)
+        # ---- (3) sosfiltfilt 等価性 (filtfilt(ba) vs sosfiltfilt(sos)) ----
+        # 既存 zansei_impl の使用条件 (order=11, Wn=PRE_HP_CUTOFF_HZ/nyq 等) を再現
+        rng_eq = _np.random.default_rng(4242)
+        N_eq = 4096
+        # sweep + white noise (フィルタを余すところなく exercise)
+        t_eq = _np.arange(N_eq, dtype=_np.float32) / sr_test
+        sweep = _sps.chirp(t_eq, f0=50.0, f1=20000.0, t1=t_eq[-1], method="logarithmic").astype(_np.float32)
+        noise = rng_eq.standard_normal(N_eq).astype(_np.float32) * 0.1
+        x_eq = (sweep + noise).astype(_np.float32)
+
+        nyq = sr_test * 0.5
+        eq_results: list[tuple[str, float, float, str]] = []  # (label, max_abs, rms_rel, tag)
+        for label, wn_hz, btype in (
+            ("pre_HP", float(PRE_HP_CUTOFF_HZ), "highpass"),
+            ("post_HP", float(POST_HP_CUTOFF_HZ), "highpass"),
+        ):
+            wn = max(1e-6, min(0.999, wn_hz / nyq))
+            # 旧 (ba)
+            old_ok = True
+            try:
+                b, a = _sps.butter(FILTER_ORDER, wn, btype=btype)
+                y_old = _sps.filtfilt(b, a, x_eq)
+                if not _np.all(_np.isfinite(y_old)):
+                    old_ok = False
+            except Exception:
+                old_ok = False
+                y_old = None
+            # 新 (sos)
+            sos = _sps.butter(FILTER_ORDER, wn, btype=btype, output="sos")
+            y_new = _sps.sosfiltfilt(sos, x_eq)
+            new_finite = bool(_np.all(_np.isfinite(y_new)))
+
+            if not new_finite:
+                eq_results.append((label, float("nan"), float("nan"), "NEW_NaN"))
+                verdict = "DEGRADED"
+                continue
+            if not old_ok or y_old is None:
+                # 旧が NaN / 例外、新は有限 → IMPROVED
+                eq_results.append((label, float("nan"), float("nan"), "OLD_FAIL_NEW_OK"))
+                if verdict == "EQUIV":
+                    verdict = "IMPROVED"
+                continue
+
+            diff = y_new - y_old
+            max_abs = float(_np.max(_np.abs(diff)))
+            rms_ref = float(_np.sqrt(_np.mean(y_old * y_old)) + 1e-30)
+            rms_rel = float(_np.sqrt(_np.mean(diff * diff))) / rms_ref
+            tag = "EQUIV"
+            if max_abs > 1e-4 or rms_rel > 1e-5:
+                tag = f"DIFFER(max={max_abs:.2e},rms={rms_rel:.2e})"
+                # 許容外の差 → DEGRADED 判定
+                verdict = "DEGRADED"
+            eq_results.append((label, max_abs, rms_rel, tag))
+
+        # ---- (4) zansei_impl の 3 負荷 determinism ----
+        rng = _np.random.default_rng(1234)
         N = 4096
-        x_stereo = rng.standard_normal((2, N)).astype(_np2.float32) * 0.05
+        x_stereo = rng.standard_normal((2, N)).astype(_np.float32) * 0.05
         sr_proc = 192000
 
         det_ok = True
-        det_notes = []
+        det_notes: list[str] = []
         for lv in LOAD_LEVELS:
             n_thr = threads_for_level(lv)
             kw = {"limits": n_thr} if n_thr > 0 else None
@@ -791,33 +838,51 @@ def _run_selftest() -> int:
                 det_ok = False
                 det_notes.append(f"{lv}:EXC({type(e).__name__})")
                 continue
-
-            if not _np2.all(_np2.isfinite(y1)) or not _np2.all(_np2.isfinite(y2)):
+            if not _np.all(_np.isfinite(y1)) or not _np.all(_np.isfinite(y2)):
                 det_notes.append(f"{lv}:NaN")
                 det_ok = False
                 continue
-
-            if _np2.array_equal(y1, y2):
+            if _np.array_equal(y1, y2):
                 det_notes.append(f"{lv}:OK")
             else:
-                max_abs = float(_np2.max(_np2.abs(y1 - y2)))
-                det_notes.append(f"{lv}:diff(max={max_abs:.3e})")
-                if max_abs > 1e-5:
+                max_abs_det = float(_np.max(_np.abs(y1 - y2)))
+                det_notes.append(f"{lv}:diff(max={max_abs_det:.3e})")
+                if max_abs_det > 1e-5:
                     det_ok = False
+        if not det_ok:
+            verdict = "DEGRADED"
+
+        # ---- (5) ffmpeg 同梱確認 ----
+        ffmpeg_path = _find_bundled(
+            os.path.join("ffmpeg", "ffmpeg.exe"),
+            os.path.join("_internal", "ffmpeg", "ffmpeg.exe"),
+        )
+        # 開発実行時 (frozen でない) は同梱を必須にしない
+        if ffmpeg_path:
+            ffmpeg_note = f"OK({os.path.basename(os.path.dirname(ffmpeg_path))}/ffmpeg.exe)"
+        elif getattr(sys, "frozen", False):
+            ffmpeg_note = "MISSING"
+            verdict = "DEGRADED"
+        else:
+            ffmpeg_note = "dev(skip)"
+
+        eq_summary = " ".join(f"{lbl}:{tag}" for (lbl, _m, _r, tag) in eq_results)
 
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(
-                f"selftest OK numpy={_np.__version__} "
+                f"selftest verdict={verdict} numpy={_np.__version__} "
                 f"scipy={_sp.__version__} librosa={_lb.__version__} "
                 f"threadpoolctl={tpc_version} "
-                f"roundtrip={rt_fmt}/{rt_subtype} "
-                f"determinism=[{' '.join(det_notes)}]\n"
+                f"roundtrip={OUTPUT_FORMAT}/{OUTPUT_SUBTYPE}={rt_status} "
+                f"sosfiltfilt_equiv=[{eq_summary}] "
+                f"determinism=[{' '.join(det_notes)}] "
+                f"ffmpeg={ffmpeg_note}\n"
             )
-        return 0 if det_ok else 1
+        return 0 if verdict != "DEGRADED" else 1
     except Exception:
         try:
             with open(log_path, "w", encoding="utf-8") as f:
-                f.write("selftest FAILED\n")
+                f.write("selftest FAILED verdict=DEGRADED\n")
                 traceback.print_exc(file=f)
         except Exception:
             traceback.print_exc()
