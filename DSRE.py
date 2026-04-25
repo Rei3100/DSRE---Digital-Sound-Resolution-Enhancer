@@ -501,17 +501,13 @@ def enhanced_zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
-    # 末尾正規化: peak ベースの安全網 (zansei_impl の mean ベース adj は廃止)
-    # 廃止理由: zansei_impl の `adj = src/(adp+src+eps)` は x と d_res が同帯域で
-    # 競合する前提だが、enhanced 版の d_res は post HP で 16kHz 以上に絞られるため
-    # 競合しない。adj を流用すると x の中域 (centroid 支配域) まで一律に減衰させ、
-    # DR と centroid が共に悪化する (selftest 1 回目で実証: DR=-1.36dB, cent=-3.1%)。
-    # 代わりに peak > 1.0 のときだけ全体スケールで clipping を回避する。
-    result = x + d_res
-    peak = float(np.max(np.abs(result))) if result.size else 0.0
-    if peak > 1.0:
-        result = result / peak
+    # **末尾に zansei_impl 同等の自動正規化** (specialist 必須助言)
+    adp = float(np.mean(np.abs(d_res)))
+    src = float(np.mean(np.abs(x)))
+    eps = 1e-12
+    adj = src / (adp + src + eps)
 
+    result = (x + d_res) * adj
     if not np.all(np.isfinite(result)):
         return np.clip(x, -1.0, 1.0)
     return result
