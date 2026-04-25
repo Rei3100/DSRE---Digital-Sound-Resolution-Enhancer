@@ -30,9 +30,11 @@ HARMONIC_LAYERS = 8         # 倍音重畳の段数
 HARMONIC_DECAY = 1.25       # 各段の減衰係数
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 16000   # 倍音生成後のハイパス
-TARGET_SR = 192000          # リサンプル先サンプリング周波数 (192 kHz)
+TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
 FILTER_ORDER = 11           # バターワース次数
-# v1.5: FLAC 192kHz / PCM_24 固定 (v1.4 の WAV 32bit float は foobar 測定で v1.3 と同値だったため revert)
+# v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
+# 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
+#       v1.5 の 192k 出力 → 主観違和感 (ボーカル裏に高音乗り) + 計算 2 倍 → v1.6 で 96k 復帰
 OUTPUT_SUBTYPE = "PCM_24"
 OUTPUT_SUBTYPE_FALLBACK = "PCM_16"  # libsndfile 異常時の安全網
 OUTPUT_FORMAT = "FLAC"
@@ -102,7 +104,7 @@ class DSREParams:
     post_hp: int = POST_HP_CUTOFF_HZ
     target_sr: int = TARGET_SR
     filter_order: int = FILTER_ORDER
-    # v1.5: FLAC 192kHz / PCM_24 固定
+    # v1.6: FLAC 96kHz / PCM_24 固定
     output_format: str = "FLAC"
     output_subtype: str = "PCM_24"
     output_subtype_fallback: str = "PCM_16"
@@ -182,7 +184,7 @@ def load_audio_safe(path):
         raise RuntimeError(f"読み込み失敗: {path}") from e
 
 
-# ===== 保存 (v1.5: 192kHz / FLAC PCM_24 + ffmpeg -c copy でメタデータ継承) =====
+# ===== 保存 (v1.6: 96kHz / FLAC PCM_24 + ffmpeg -c copy でメタデータ継承) =====
 def _try_sf_write(path, data, sr, subtype, fmt):
     """書込 → 読み直しで shape / sr が一致するかをラウンドトリップ検証する。
     失敗時は中途半端に残ったファイルを削除して False を返す。"""
@@ -202,7 +204,13 @@ def _try_sf_write(path, data, sr, subtype, fmt):
 
 
 def save_flac24_out(in_path, y_out, sr, out_path):
-    """DSP 結果を FLAC 192kHz / PCM_24 として書き出し、ffmpeg でメタデータを継承する。
+    """DSP 結果を FLAC <TARGET_SR=96kHz> / PCM_24 として書き出し、ffmpeg でメタデータを継承する。
+
+    v1.6 で 96kHz に戻し (理由):
+    - v1.5 で 192k/PCM_24 を ship したが、ユーザー主観で「ボーカル裏に高音乗り」違和感
+    - 192k は DSEE HX 思想 (44.1k → 96k アップスケーリング) を逸脱、可聴域外倍音が
+      DAC/HP で intermodulation を生んで可聴域に折り返す仮説
+    - 96k 戻しで DSP ロジックは本家相当、計算量も約 50% 減 (負荷も同時に軽減)
 
     v1.5 で v1.3 方式に revert (理由):
     - v1.4 で WAV 32bit float に変更したが、foobar2000 で v1.3 (FLAC PCM_24) と
@@ -342,7 +350,7 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
 
         shift = sr * (i + 1) / (total * 2.0)
         # ナイキスト到達/超過のシフト層はスキップ (折り返しアーティファクト防止)。
-        # 現パラメータ (total=8, sr=192000) では最大 shift=96000=nyq なので最終層のみスキップ。
+        # 現パラメータ (total=8, sr=96000) では最大 shift=48000=nyq なので最終層のみスキップ。
         if shift >= nyq:
             if progress_cb:
                 progress_cb(i + 1, total)
@@ -713,8 +721,8 @@ def _run_selftest() -> int:
 
     検査層 (v1.5 で FLAC PCM_24 ロードトリップに revert):
       (1) 必須 import (numpy/scipy/librosa/resampy/soundfile/send2trash/PySide6/threadpoolctl)
-      (2) FLAC 192 kHz / PCM_24 roundtrip: shape + sr 一致 + 量子化誤差 < 1.5e-7 (2^-23)
-          v1.4 の WAV FLOAT (1e-6 閾値) から revert
+      (2) FLAC <TARGET_SR=96 kHz> / PCM_24 roundtrip: shape + sr 一致 + 量子化誤差 < 1.5e-7 (2^-23)
+          v1.4 の WAV FLOAT (1e-6 閾値) から revert、v1.6 で 96k に変更
       (3) sosfiltfilt 等価性: 旧 filtfilt(ba) と新 sosfiltfilt(sos) で low Wn 11 次
           Butterworth を回し、max_abs_diff < 1e-4 / rms_diff / rms_ref < 1e-5 を確認
           (旧が NaN を吐き新が有限値のときは IMPROVED)
@@ -748,8 +756,8 @@ def _run_selftest() -> int:
         notes: list[str] = []
         verdict = "EQUIV"
 
-        # ---- (2) FLAC 192 kHz / PCM_24 roundtrip ----
-        sr_test = 192000
+        # ---- (2) FLAC <TARGET_SR> kHz / PCM_24 roundtrip ----
+        sr_test = TARGET_SR  # v1.6: TARGET_SR 参照に変更 (96k に戻したため hard-coded 192000 を排除)
         t = _np.arange(sr_test // 20, dtype=_np.float32) / sr_test
         sig_mono = (0.25 * _np.sin(2 * _np.pi * 1000.0 * t)).astype(_np.float32)
         sig_stereo = _np.stack([sig_mono, sig_mono], axis=1)
@@ -863,7 +871,7 @@ def _run_selftest() -> int:
         rng = _np.random.default_rng(1234)
         N = 4096
         x_stereo = rng.standard_normal((2, N)).astype(_np.float32) * 0.05
-        sr_proc = 192000
+        sr_proc = TARGET_SR  # v1.6: TARGET_SR 参照
 
         det_ok = True
         det_notes: list[str] = []
