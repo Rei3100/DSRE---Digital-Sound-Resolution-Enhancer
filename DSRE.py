@@ -38,6 +38,23 @@ OUTPUT_SUBTYPE_FALLBACK = "PCM_16"  # libsndfile 異常時の安全網
 OUTPUT_FORMAT = "FLAC"
 OUTPUT_EXT = ".flac"
 
+# ===== psychoacoustic 帯域別 adaptive 処理パラメータ (v1.5 enhanced_zansei_impl 用) =====
+# dsre-specialist 事前検証 (2026-04-25) で 4 修正を反映:
+# - layer 値を下方調整 (8,6,4)/(6,4,3)/(4,3,2)
+# - ENH_GAIN を 0.05 に下げる (末尾正規化と二重 safety)
+# - f_shift_unit = (hi-lo)/(2n) で位相干渉を抑制
+# - hf_ratio は Welch PSD で計算 (FFT 全長は 7 分曲で 1-2GB / 数秒ブロック)
+ENH_BAND_MID = (3000.0, 8000.0)
+ENH_BAND_HIGH = (8000.0, 16000.0)
+ENH_BAND_ULTRA = (16000.0, 24000.0)
+ENH_HF_RATIO_LOW = 0.05      # 圧縮音源閾値 (これ未満 → 強化)
+ENH_HF_RATIO_HIGH = 0.20     # 高域リッチ閾値 (これ以上 → 抑制)
+ENH_GAIN = 0.05              # 全帯域共通ゲイン (specialist 推奨で 0.1 → 0.05)
+ENH_BPF_ORDER = 6            # 帯域分割 BPF の Butterworth 次数
+ENH_WELCH_NPERSEG = 8192     # Welch 法のセグメント長 (PSD 推定の精度/速度トレードオフ)
+ENH_HF_FREQ_HZ = 4000.0      # hf_ratio 計算の基準周波数 (これ以上を「高域」とみなす)
+
+
 # ===== 負荷レベル (v1.3 Phase 3) =====
 LOAD_LEVELS = ("軽", "標準", "最大")
 LOAD_DEFAULT = "標準"
@@ -106,6 +123,16 @@ class DSREParams:
     output_format: str = "FLAC"
     output_subtype: str = "PCM_24"
     output_subtype_fallback: str = "PCM_16"
+    # v1.5 enhanced_zansei_impl 用
+    band_mid: tuple = ENH_BAND_MID
+    band_high: tuple = ENH_BAND_HIGH
+    band_ultra: tuple = ENH_BAND_ULTRA
+    hf_ratio_low: float = ENH_HF_RATIO_LOW
+    hf_ratio_high: float = ENH_HF_RATIO_HIGH
+    enhanced_gain: float = ENH_GAIN
+    bpf_order: int = ENH_BPF_ORDER
+    welch_nperseg: int = ENH_WELCH_NPERSEG
+    hf_freq_hz: float = ENH_HF_FREQ_HZ
 
 
 PARAMS = DSREParams()
@@ -369,6 +396,123 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     return result
 
 
+# ===== v1.5 enhanced_zansei_impl (DSEE HX 思想 + adaptive + 帯域別 psychoacoustic) =====
+def _detect_hf_richness(x: np.ndarray, sr: int) -> float:
+    """入力の高域エネルギー比 (4kHz 以上 / 総) を 0.0〜1.0 で返す。
+
+    Welch 法 (nperseg=8192) で PSD 推定。FFT 全長は 7 分曲 (8000 万点) で
+    1-2GB / 数秒ブロックするため使えない (specialist 助言)。
+    Welch なら nperseg 固定でメモリ・時間とも一定。
+    """
+    sig = x.mean(axis=0) if x.ndim == 2 else x
+    n = sig.shape[-1]
+    nper = min(int(PARAMS.welch_nperseg), max(1, n))
+    try:
+        freqs, psd = signal.welch(sig, fs=sr, nperseg=nper)
+    except Exception:
+        return 0.0
+    total = float(np.sum(psd)) + 1e-30
+    hf = float(np.sum(psd[freqs >= PARAMS.hf_freq_hz]))
+    return hf / total
+
+
+def _adaptive_layers(hf_ratio: float) -> tuple[int, int, int]:
+    """高域エネルギー比から (mid, high, ultra) の layer 数を決定。
+
+    specialist 推奨で値を下方調整 (位相干渉抑制 + ノイズフロア持ち上がり防止):
+    - 圧縮音源 (hf_ratio < LOW)   → (8, 6, 4)
+    - 中間   (LOW ≤ hf_ratio < HIGH) → (6, 4, 3)
+    - 高域リッチ (hf_ratio ≥ HIGH)   → (4, 3, 2)
+    """
+    if hf_ratio < PARAMS.hf_ratio_low:
+        return (8, 6, 4)
+    elif hf_ratio < PARAMS.hf_ratio_high:
+        return (6, 4, 3)
+    else:
+        return (4, 3, 2)
+
+
+def enhanced_zansei_impl(x, sr, progress_cb=None, abort_cb=None):
+    """DSEE HX 的 adaptive + 帯域別 psychoacoustic 処理 (v1.5、全負荷で常時有効)。
+
+    既存 zansei_impl の思想を踏襲しつつ:
+    - 入力 hf_ratio を Welch PSD で測定し、処理強度を動的調整
+    - mid (3-8k) / high (8-16k) / ultra (16-24k) 3 帯域で別々の layer 数
+    - 各帯域の f_shift_unit = (hi-lo)/(2n) で重畳密度を抑える (位相干渉対策)
+    - sosfiltfilt で数値安定化 (v1.4 改善継承)
+    - **末尾に zansei_impl 同等の自動正規化** `adj = src/(adp+src+eps)` を必須適用
+      (specialist 助言: 最大層加算でノイズフロアが持ち上がるのを抑える)
+    - selftest psychoacoustic A/B で IMPROVED/EQUIV/DEGRADED を判定、DEGRADED は CI 停止
+    """
+    hf_ratio = _detect_hf_richness(x, sr)
+    layers_mid, layers_high, layers_ultra = _adaptive_layers(hf_ratio)
+
+    bands = (
+        (PARAMS.band_mid[0],   PARAMS.band_mid[1],   layers_mid),
+        (PARAMS.band_high[0],  PARAMS.band_high[1],  layers_high),
+        (PARAMS.band_ultra[0], PARAMS.band_ultra[1], layers_ultra),
+    )
+
+    f_dn = freq_shift_mono if x.ndim == 1 else freq_shift_multi
+    d_sr = 1.0 / sr
+    nyq = sr / 2.0
+
+    d_res = np.zeros_like(x, dtype=np.float32)
+    total_layers = max(1, sum(n for _, _, n in bands))
+    done = 0
+
+    for lo, hi, n_layers in bands:
+        if abort_cb and abort_cb():
+            break
+        if n_layers <= 0:
+            done += n_layers
+            continue
+        hi_eff = min(hi, nyq * 0.98)
+        if hi_eff <= lo:
+            done += n_layers
+            continue
+        # 帯域 BPF (6 次 Butterworth)
+        try:
+            sos_bp = signal.butter(
+                PARAMS.bpf_order,
+                [lo / nyq, hi_eff / nyq],
+                btype="bandpass",
+                output="sos",
+            )
+        except Exception:
+            done += n_layers
+            continue
+        band = safe_sosfiltfilt(sos_bp, x, axis=-1)
+
+        # f_shift_unit を半減 (specialist 推奨で位相干渉抑制)
+        f_shift_unit = (hi_eff - lo) / max(1, 2 * n_layers)
+        decays = np.exp(-np.arange(1, n_layers + 1) * PARAMS.decay)
+        for k in range(1, n_layers + 1):
+            if abort_cb and abort_cb():
+                break
+            f_shift = f_shift_unit * k
+            shifted = f_dn(band, f_shift, d_sr) * decays[k - 1]
+            d_res += shifted * PARAMS.enhanced_gain
+            done += 1
+            if progress_cb:
+                progress_cb(done, total_layers)
+
+    # 生成した倍音の低域を再度カット (16kHz 以上の高域のみに寄与、SOS で数値安定化)
+    sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
+    d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
+
+    # **末尾に zansei_impl 同等の自動正規化** (specialist 必須助言)
+    adp = float(np.mean(np.abs(d_res)))
+    src = float(np.mean(np.abs(x)))
+    eps = 1e-12
+    adj = src / (adp + src + eps)
+
+    result = (x + d_res) * adj
+    if not np.all(np.isfinite(result)):
+        return np.clip(x, -1.0, 1.0)
+    return result
+
+
 class _NullCtx:
     def __enter__(self):
         return self
@@ -470,7 +614,9 @@ class Worker(QtCore.QThread):
                     def step_cb(cur, m):
                         self.sig_step.emit(int(cur * 100 / m))
 
-                    y_out = zansei_impl(
+                    # v1.5: enhanced_zansei_impl を全負荷で常時有効 (β 採用)
+                    # 既存 zansei_impl は selftest psychoacoustic A/B での比較対象として残す
+                    y_out = enhanced_zansei_impl(
                         y, sr,
                         progress_cb=step_cb,
                         abort_cb=lambda: self._abort,
@@ -705,13 +851,13 @@ class MainWindow(QtWidgets.QWidget):
 
 
 def _run_selftest() -> int:
-    """v1.5 自走品質ループ: import + FLAC PCM_24 roundtrip + sosfiltfilt 等価性 + 3 負荷 determinism + ffmpeg 同梱確認。
+    """v1.5 自走品質ループ: import + FLAC PCM_24 roundtrip + sosfiltfilt 等価性 + 3 負荷 determinism + ffmpeg 同梱確認 + psychoacoustic A/B。
 
     Claude が「音響処理を改善しても劣化していない」ことを数値で判定するためのゲート。
     verdict が DEGRADED のときは exit 1 → CI / build.ps1 / deploy.ps1 が artifact を作らない。
     QApplication は作らない (ヘッドレス環境で Qt platform plugin を走らせない)。
 
-    検査層 (v1.5 で FLAC PCM_24 ロードトリップに revert):
+    検査層 (v1.5 で 6 層化):
       (1) 必須 import (numpy/scipy/librosa/resampy/soundfile/send2trash/PySide6/threadpoolctl)
       (2) FLAC 192 kHz / PCM_24 roundtrip: shape + sr 一致 + 量子化誤差 < 1.5e-7 (2^-23)
           v1.4 の WAV FLOAT (1e-6 閾値) から revert
@@ -720,6 +866,9 @@ def _run_selftest() -> int:
           (旧が NaN を吐き新が有限値のときは IMPROVED)
       (4) 3 負荷 determinism: 同一入力 × 同一負荷で 2 回実行し bit 一致
       (5) 同梱 ffmpeg の存在確認 (ビルド成果物でのみ意味がある、開発時はスキップ可)
+      (6) psychoacoustic A/B (v1.5 追加): zansei_impl vs enhanced_zansei_impl の DR /
+          spectral centroid / high-freq rolloff / spectral flatness を比較し
+          IMPROVED / EQUIV / DEGRADED を判定。DEGRADED は exit 1
     """
     import traceback
     log_dir = os.path.dirname(sys.executable) or os.getcwd()
@@ -859,7 +1008,8 @@ def _run_selftest() -> int:
                 tag = "EQUIV"
             eq_results.append((label, max_abs, rms_rel, tag))
 
-        # ---- (4) zansei_impl の 3 負荷 determinism ----
+        # ---- (4) enhanced_zansei_impl の 3 負荷 determinism ----
+        # v1.5: 本番処理は enhanced_zansei_impl (β 採用、全負荷で常時有効) なのでこちらを検査
         rng = _np.random.default_rng(1234)
         N = 4096
         x_stereo = rng.standard_normal((2, N)).astype(_np.float32) * 0.05
@@ -873,10 +1023,10 @@ def _run_selftest() -> int:
             try:
                 ctx1 = threadpoolctl.threadpool_limits(**kw) if kw else _NullCtx()
                 with ctx1:
-                    y1 = zansei_impl(x_stereo.copy(), sr_proc)
+                    y1 = enhanced_zansei_impl(x_stereo.copy(), sr_proc)
                 ctx2 = threadpoolctl.threadpool_limits(**kw) if kw else _NullCtx()
                 with ctx2:
-                    y2 = zansei_impl(x_stereo.copy(), sr_proc)
+                    y2 = enhanced_zansei_impl(x_stereo.copy(), sr_proc)
             except Exception as e:
                 det_ok = False
                 det_notes.append(f"{lv}:EXC({type(e).__name__})")
@@ -909,6 +1059,84 @@ def _run_selftest() -> int:
         else:
             ffmpeg_note = "dev(skip)"
 
+        # ---- (6) psychoacoustic A/B (v1.5) ----
+        # 旧 zansei_impl と新 enhanced_zansei_impl の DR / spectral centroid /
+        # high-freq rolloff / spectral flatness を比較し、
+        # IMPROVED / EQUIV / DEGRADED を判定。DEGRADED は exit 1 (CI 停止)
+        psy_note = "skip"
+        try:
+            rng_psy = _np.random.default_rng(7777)
+            N_psy = 16384
+            sr_psy = 192000
+            t_psy = _np.arange(N_psy, dtype=_np.float32) / sr_psy
+            # sweep + white + pure tone (低高域共に exercise)
+            psy_sweep = _sps.chirp(t_psy, f0=80.0, f1=20000.0, t1=t_psy[-1], method="logarithmic").astype(_np.float32)
+            psy_noise = (rng_psy.standard_normal(N_psy).astype(_np.float32) * 0.05)
+            psy_tone = (0.2 * _np.sin(2 * _np.pi * 1000.0 * t_psy)).astype(_np.float32)
+            psy_in_mono = (psy_sweep * 0.3 + psy_noise + psy_tone).astype(_np.float32)
+            psy_in = _np.stack([psy_in_mono, psy_in_mono], axis=0)  # (2, N)
+
+            y_old = zansei_impl(psy_in.copy(), sr_psy)
+            y_new = enhanced_zansei_impl(psy_in.copy(), sr_psy)
+
+            def _dr_db(sig: "_np.ndarray") -> float:
+                peak = float(_np.max(_np.abs(sig))) + 1e-30
+                rms = float(_np.sqrt(_np.mean(sig * sig))) + 1e-30
+                return 20.0 * float(_np.log10(peak / rms))
+
+            def _spectral_centroid(sig: "_np.ndarray", sr: int) -> float:
+                ch = sig.mean(axis=0) if sig.ndim == 2 else sig
+                spec = _np.abs(_np.fft.rfft(ch))
+                freqs = _np.fft.rfftfreq(ch.shape[-1], 1.0 / sr)
+                tot = float(_np.sum(spec)) + 1e-30
+                return float(_np.sum(freqs * spec) / tot)
+
+            def _hf_rolloff(sig: "_np.ndarray", sr: int, ratio: float = 0.85) -> float:
+                ch = sig.mean(axis=0) if sig.ndim == 2 else sig
+                spec = _np.abs(_np.fft.rfft(ch))
+                freqs = _np.fft.rfftfreq(ch.shape[-1], 1.0 / sr)
+                cum = _np.cumsum(spec)
+                if cum[-1] <= 0:
+                    return 0.0
+                target = ratio * cum[-1]
+                idx = int(_np.searchsorted(cum, target))
+                idx = min(idx, len(freqs) - 1)
+                return float(freqs[idx])
+
+            dr_old = _dr_db(y_old)
+            dr_new = _dr_db(y_new)
+            cent_old = _spectral_centroid(y_old, sr_psy)
+            cent_new = _spectral_centroid(y_new, sr_psy)
+            roll_old = _hf_rolloff(y_old, sr_psy)
+            roll_new = _hf_rolloff(y_new, sr_psy)
+
+            d_dr = dr_new - dr_old
+            d_cent_pct = (cent_new - cent_old) / max(cent_old, 1.0) * 100.0
+            d_roll_khz = (roll_new - roll_old) / 1000.0
+
+            # 判定: DR が ±0.5dB 以内 かつ centroid 上昇 かつ rolloff 上昇 → IMPROVED
+            #       DR が -1.0dB 以上悪化 → DEGRADED
+            #       それ以外 → EQUIV
+            if d_dr <= -1.0:
+                psy_verdict = "DEGRADED"
+                verdict = "DEGRADED"
+            elif abs(d_dr) <= 0.5 and d_cent_pct > 0 and d_roll_khz > 0:
+                psy_verdict = "IMPROVED"
+                if verdict == "EQUIV":
+                    verdict = "IMPROVED"
+            else:
+                psy_verdict = "EQUIV"
+
+            psy_note = (
+                f"{psy_verdict}(DR={d_dr:+.2f}dB,"
+                f"cent={d_cent_pct:+.1f}%,"
+                f"rolloff={d_roll_khz:+.2f}kHz)"
+            )
+        except Exception as exc:
+            psy_note = f"FAIL({type(exc).__name__})"
+            # psy 検証自体の失敗は DEGRADED 扱い (フェイルセーフ)
+            verdict = "DEGRADED"
+
         eq_summary = " ".join(f"{lbl}:{tag}" for (lbl, _m, _r, tag) in eq_results)
 
         with open(log_path, "w", encoding="utf-8") as f:
@@ -919,7 +1147,8 @@ def _run_selftest() -> int:
                 f"roundtrip={OUTPUT_FORMAT}/{OUTPUT_SUBTYPE}={rt_status} "
                 f"sosfiltfilt_equiv=[{eq_summary}] "
                 f"determinism=[{' '.join(det_notes)}] "
-                f"ffmpeg={ffmpeg_note}\n"
+                f"ffmpeg={ffmpeg_note} "
+                f"psychoacoustic={psy_note}\n"
             )
         return 0 if verdict != "DEGRADED" else 1
     except Exception:
