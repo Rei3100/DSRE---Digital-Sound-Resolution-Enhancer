@@ -32,10 +32,11 @@ PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 16000   # 倍音生成後のハイパス
 TARGET_SR = 192000          # リサンプル先サンプリング周波数 (192 kHz)
 FILTER_ORDER = 11           # バターワース次数
-OUTPUT_SUBTYPE = "FLOAT"    # v1.4: 32-bit IEEE float WAV (libsndfile 完全対応、量子化ノイズ消滅)
-OUTPUT_FORMAT = "WAV"
-OUTPUT_EXT = ".wav"
-
+# v1.5: FLAC 192kHz / PCM_24 固定 (v1.4 の WAV 32bit float は foobar 測定で v1.3 と同値だったため revert)
+OUTPUT_SUBTYPE = "PCM_24"
+OUTPUT_SUBTYPE_FALLBACK = "PCM_16"  # libsndfile 異常時の安全網
+OUTPUT_FORMAT = "FLAC"
+OUTPUT_EXT = ".flac"
 
 # ===== 負荷レベル (v1.3 Phase 3) =====
 LOAD_LEVELS = ("軽", "標準", "最大")
@@ -101,8 +102,10 @@ class DSREParams:
     post_hp: int = POST_HP_CUTOFF_HZ
     target_sr: int = TARGET_SR
     filter_order: int = FILTER_ORDER
-    output_format: str = "WAV"
-    output_subtype: str = "FLOAT"
+    # v1.5: FLAC 192kHz / PCM_24 固定
+    output_format: str = "FLAC"
+    output_subtype: str = "PCM_24"
+    output_subtype_fallback: str = "PCM_16"
 
 
 PARAMS = DSREParams()
@@ -179,7 +182,7 @@ def load_audio_safe(path):
         raise RuntimeError(f"読み込み失敗: {path}") from e
 
 
-# ===== 保存 (v1.4: 192kHz / 32-bit IEEE float WAV + ffmpeg -c copy でメタデータ継承) =====
+# ===== 保存 (v1.5: 192kHz / FLAC PCM_24 + ffmpeg -c copy でメタデータ継承) =====
 def _try_sf_write(path, data, sr, subtype, fmt):
     """書込 → 読み直しで shape / sr が一致するかをラウンドトリップ検証する。
     失敗時は中途半端に残ったファイルを削除して False を返す。"""
@@ -198,16 +201,20 @@ def _try_sf_write(path, data, sr, subtype, fmt):
         return False
 
 
-def save_wav32float_out(in_path, y_out, sr, out_path):
-    """DSP 結果を 32-bit IEEE float WAV として書き出し、ffmpeg でメタデータを継承する。
+def save_flac24_out(in_path, y_out, sr, out_path):
+    """DSP 結果を FLAC 192kHz / PCM_24 として書き出し、ffmpeg でメタデータを継承する。
 
-    - 32-bit float WAV (subtype="FLOAT", format="WAV") は libsndfile 完全対応、
-      foobar2000 では "32-bit floating-point" と表示される
-    - 32-bit float の動的レンジは実用上無限 (clipping 量子化ノイズ皆無)
-    - 再生機器側の入力段で >1.0 を嫌うケースに備え、peak>0.99 のときは
-      -1dBFS 相当に緩くスケールダウンする
-    - メタデータ継承は ffmpeg `-map_metadata 1 -c copy -write_id3v2 1` で実施。
-      入力が FLAC (Vorbis Comment) でも WAV (LIST/INFO) でも、タグが自動変換される。
+    v1.5 で v1.3 方式に revert (理由):
+    - v1.4 で WAV 32bit float に変更したが、foobar2000 で v1.3 (FLAC PCM_24) と
+      DR / PLR / 波形すべて同値だった (32bit 化に音質メリット無し、重量増のみ)
+    - 24bit の DR は理論上 144dB、実用上の必要 DR (~100dB) を既に上回る
+    - 出荷物は FLAC のみ (Vorbis Comment ネイティブ、metadata は ffmpeg `-c copy` で継承)
+
+    保存パス:
+    - PCM_24 primary → PCM_16 fallback の 2 段試行 (libsndfile 異常時の安全網)
+    - peak > 1.0 のときのみ正規化 (v1.4 の 0.99 スケールは過剰だった、v1.3 方式)
+    - ffmpeg コマンドは `-map_metadata 1 -c copy` のみ (FLAC は Vorbis Comment が
+      native、`-write_id3v2 1` は不要。WAV 専用フラグだったので v1.4 から削除)
     """
     if y_out.ndim == 1:
         data = y_out.reshape(-1, 1)
@@ -215,27 +222,32 @@ def save_wav32float_out(in_path, y_out, sr, out_path):
         data = y_out.T
     data = data.astype(np.float32, copy=False)
 
+    # v1.3 方式: peak が 1.0 を超えたときのみ 1.0 に揃える (緩い clip 防止)
     peak = float(np.max(np.abs(data))) if data.size else 0.0
-    if peak > 0.99:
-        data = data * (0.99 / peak)
+    if peak > 1.0:
+        data = data / peak
 
     base = os.path.splitext(out_path)[0]
     final_path = base + OUTPUT_EXT
 
-    # 一時 WAV に書込 (メタデータ無し)
-    tmp_path = final_path + ".tmp_src.wav"
-    if not _try_sf_write(tmp_path, data, sr, OUTPUT_SUBTYPE, OUTPUT_FORMAT):
-        raise RuntimeError(f"WAV FLOAT 書込失敗: {final_path}")
+    # 一時 FLAC に書込 (メタデータ無し)、PCM_24 → PCM_16 の順に試行
+    tmp_path = final_path + ".tmp_src.flac"
+    wrote = False
+    for subtype in (OUTPUT_SUBTYPE, OUTPUT_SUBTYPE_FALLBACK):
+        if _try_sf_write(tmp_path, data, sr, subtype, OUTPUT_FORMAT):
+            wrote = True
+            break
+    if not wrote:
+        raise RuntimeError(f"FLAC 書込失敗 (PCM_24 / PCM_16 共に NG): {final_path}")
 
     # ffmpeg でメタデータ継承 (音声は -c copy で再エンコード無し = 完全無劣化)
     cmd = [
         "ffmpeg", "-y",
-        "-i", tmp_path,     # 音声ソース (DSP 済 WAV FLOAT)
+        "-i", tmp_path,     # 音声ソース (DSP 済 FLAC)
         "-i", in_path,      # メタデータソース (元 FLAC 等)
         "-map", "0:a",
         "-map_metadata", "1",
         "-c", "copy",
-        "-write_id3v2", "1",  # WAV にも ID3v2 チャンクを書く
         final_path,
     ]
     try:
@@ -465,7 +477,7 @@ class Worker(QtCore.QThread):
                     )
 
                     out = os.path.join(OUTPUT_DIR, os.path.basename(path))
-                    save_wav32float_out(path, y_out, sr, out)
+                    save_flac24_out(path, y_out, sr, out)
 
                     try:
                         send2trash(path)
@@ -693,15 +705,16 @@ class MainWindow(QtWidgets.QWidget):
 
 
 def _run_selftest() -> int:
-    """v1.4 自走品質ループ: import + WAV FLOAT roundtrip + sosfiltfilt 等価性 + 3 負荷 determinism + ffmpeg 同梱確認。
+    """v1.5 自走品質ループ: import + FLAC PCM_24 roundtrip + sosfiltfilt 等価性 + 3 負荷 determinism + ffmpeg 同梱確認。
 
     Claude が「音響処理を改善しても劣化していない」ことを数値で判定するためのゲート。
     verdict が DEGRADED のときは exit 1 → CI / build.ps1 / deploy.ps1 が artifact を作らない。
     QApplication は作らない (ヘッドレス環境で Qt platform plugin を走らせない)。
 
-    検査層:
+    検査層 (v1.5 で FLAC PCM_24 ロードトリップに revert):
       (1) 必須 import (numpy/scipy/librosa/resampy/soundfile/send2trash/PySide6/threadpoolctl)
-      (2) WAV 192 kHz / 32bit-float (IEEE float) roundtrip: shape + sr 一致 + 量子化誤差 ~0
+      (2) FLAC 192 kHz / PCM_24 roundtrip: shape + sr 一致 + 量子化誤差 < 1.5e-7 (2^-23)
+          v1.4 の WAV FLOAT (1e-6 閾値) から revert
       (3) sosfiltfilt 等価性: 旧 filtfilt(ba) と新 sosfiltfilt(sos) で low Wn 11 次
           Butterworth を回し、max_abs_diff < 1e-4 / rms_diff / rms_ref < 1e-5 を確認
           (旧が NaN を吐き新が有限値のときは IMPROVED)
@@ -735,7 +748,7 @@ def _run_selftest() -> int:
         notes: list[str] = []
         verdict = "EQUIV"
 
-        # ---- (2) WAV 192 kHz / FLOAT roundtrip ----
+        # ---- (2) FLAC 192 kHz / PCM_24 roundtrip ----
         sr_test = 192000
         t = _np.arange(sr_test // 20, dtype=_np.float32) / sr_test
         sig_mono = (0.25 * _np.sin(2 * _np.pi * 1000.0 * t)).astype(_np.float32)
@@ -743,22 +756,25 @@ def _run_selftest() -> int:
 
         rt_max_abs = float("nan")
         rt_status = "FAIL"
-        tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tmp_wav.close()
+        # PCM_24 の量子化誤差: 2^-23 ≈ 1.19e-7 (signed 24bit の最小単位)
+        # マージン込みで 1.5e-7 を閾値に
+        RT_THRESHOLD = 1.5e-7
+        tmp_flac = tempfile.NamedTemporaryFile(delete=False, suffix=".flac")
+        tmp_flac.close()
         try:
-            _sf.write(tmp_wav.name, sig_stereo, sr_test, subtype=OUTPUT_SUBTYPE, format=OUTPUT_FORMAT)
-            data_read, sr_read = _sf.read(tmp_wav.name, always_2d=True, dtype="float32")
+            _sf.write(tmp_flac.name, sig_stereo, sr_test, subtype=OUTPUT_SUBTYPE, format=OUTPUT_FORMAT)
+            data_read, sr_read = _sf.read(tmp_flac.name, always_2d=True, dtype="float32")
             assert sr_read == sr_test, f"sr mismatch {sr_read}!={sr_test}"
             assert data_read.shape == sig_stereo.shape, "shape mismatch after round-trip"
             rt_max_abs = float(_np.max(_np.abs(data_read - sig_stereo)))
-            # PCM_FLOAT は bit-exact 近い (量子化ノイズなし、IEEE float の丸めのみ)
-            rt_status = "OK" if rt_max_abs < 1e-6 else f"LOSSY({rt_max_abs:.2e})"
-            if rt_max_abs >= 1e-6:
+            # FLAC PCM_24 は loss-less な量子化 (24bit 精度内で復元可能)
+            rt_status = "OK" if rt_max_abs < RT_THRESHOLD else f"LOSSY({rt_max_abs:.2e})"
+            if rt_max_abs >= RT_THRESHOLD:
                 verdict = "DEGRADED"
         finally:
             try:
-                if os.path.exists(tmp_wav.name):
-                    os.remove(tmp_wav.name)
+                if os.path.exists(tmp_flac.name):
+                    os.remove(tmp_flac.name)
             except OSError:
                 pass
 
