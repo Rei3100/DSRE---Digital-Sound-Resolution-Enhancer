@@ -4,7 +4,10 @@
 - **メインファイル**: `DSRE.py` (単一ファイル、約 700-800 行、PySide6 製 GUI + DSP)
 - **設定ファイル**: なし (入出力は `INPUT_DIR` / `OUTPUT_DIR` 定数でハードコード: `C:\Audio\DSRE` / `C:\Audio\DSRE\Output`)
 - **Python**: 3.11 のみ対応 (PySide6 は 3.11 に install 済み、`py -3.11` で検証)
-- **出力フォーマット (v1.5 で確定)**: **FLAC 192kHz / PCM_24 固定**。v1.4 で WAV 32bit float を試したが foobar 測定で v1.3 (FLAC PCM_24) と DR/PLR/波形すべて同値だったため revert。「意味のない変更禁止」ルールの初適用事例
+- **出力フォーマット (v1.6 で確定)**: **FLAC 96kHz / PCM_24 固定**。
+  - v1.5 で 192k 化したが、ユーザー主観で「ボーカル裏に高音乗り」違和感 + 計算 2 倍の負荷増 → v1.6 で 96k に revert
+  - 192k は DSEE HX 思想 (Sony 公式も 96k 上限) を逸脱、可聴域外倍音が DAC/HP で intermodulation を生む仮説
+  - v1.4 の 32bit float (foobar 測定で v1.3 と同値で revert) と並ぶ「過剰品質→副作用」事例の 2 つ目
 
 ## 由来・フォーク事情
 - 本家: [x1aoqv/DSRE---Digital-Sound-Resolution-Enhancer](https://github.com/x1aoqv/DSRE---Digital-Sound-Resolution-Enhancer) (507 行)
@@ -22,7 +25,7 @@
 5. **Windows subprocess**: 必ず `creationflags=CREATE_NO_WINDOW`、コマンドプロンプトをポップさせない
 6. **INPUT_DIR / OUTPUT_DIR はハードコード維持** (個人ワークフローで固定、UI から変更させない方針)
 7. **新機能は plan → 承認 → 実装**。plan 冒頭に Claude Code 育成 9 項目テーブルを付けること
-8. **出力フォーマット FLAC 192/24 固定** (v1.5 確定)。WAV 32bit float / PCM_32 等への変更は**事前に「3 問チェック (利益/不足/重量)」全て yes** が必要
+8. **出力フォーマット FLAC 96kHz / PCM_24 固定** (v1.6 確定)。**sr / bit / layer 数等の品質パラメータを上げる前に「3 問チェック (利益/不足/重量)」+ 主観 A/B 必要性自問の両方が必要**。32bit 化 (v1.4) と 192k 化 (v1.5) は数値テストでは検出できない副作用を持っていた
 
 ## 音響処理改善ルール (v1.5 改訂)
 - ユーザーは最終の foobar2000 実聴確認のみ。**仮説・実装・客観検証は Claude が完結**
@@ -39,6 +42,8 @@
 
 DSRE の音響処理は **DSEE HX 思想**を継承する (グローバル CLAUDE.md「DSRE 方向性記事」節参照):
 
+- **DSEE HX 思想は「44.1k → 96k アップスケーリング」が核**、Sony 公式も 96k 上限
+- 「ハイレゾ化」≠「アップサンプリング」。DSRE は後者であり 96k で十分 (192k は対象外)
 - **段階的帯域拡張**: 低/中/高/超高域で別々に処理 (v1.5 で mid 3-8k / high 8-16k / ultra 16-24k に分割)
 - **adaptive processing**: 入力 hf_ratio (4kHz 以上 / 総エネルギー) を測定し処理強度を動的調整
   - 圧縮音源 (hf_ratio < 0.05) → 強化 (layer 12/8/6)
