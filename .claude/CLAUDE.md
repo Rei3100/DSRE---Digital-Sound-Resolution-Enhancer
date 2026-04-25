@@ -1,9 +1,10 @@
 # DSRE プロジェクト階層ルール
 
 ## 主対象
-- **メインファイル**: `DSRE.py` (単一ファイル、約 300 行、PySide6 製 GUI + DSP)
+- **メインファイル**: `DSRE.py` (単一ファイル、約 700-800 行、PySide6 製 GUI + DSP)
 - **設定ファイル**: なし (入出力は `INPUT_DIR` / `OUTPUT_DIR` 定数でハードコード: `C:\Audio\DSRE` / `C:\Audio\DSRE\Output`)
 - **Python**: 3.11 のみ対応 (PySide6 は 3.11 に install 済み、`py -3.11` で検証)
+- **出力フォーマット (v1.5 で確定)**: **FLAC 192kHz / PCM_24 固定**。v1.4 で WAV 32bit float を試したが foobar 測定で v1.3 (FLAC PCM_24) と DR/PLR/波形すべて同値だったため revert。「意味のない変更禁止」ルールの初適用事例
 
 ## 由来・フォーク事情
 - 本家: [x1aoqv/DSRE---Digital-Sound-Resolution-Enhancer](https://github.com/x1aoqv/DSRE---Digital-Sound-Resolution-Enhancer) (507 行)
@@ -13,24 +14,39 @@
 - 音質は本家 zansei_impl の方向性を基準に、**劣化させない改善は積極的に採用**
 - v2.0 の psychoacoustic_enhancer / multiband_exciter も**客観検証を通せば採用可能** (v1.4 以降)
 
-## 絶対ルール (2026-04-24 改訂、v1.4 以降)
+## 絶対ルール (2026-04-25 改訂、v1.5 以降)
 1. **UI 最低限の維持 + 改善歓迎**: ボタン名「開始」「一時停止」「取消」は維持、`setWindowTitle("DSRE")` は維持。負荷選択・システムトレイ・アイコン表示等の**機能拡張は可**。resize 値は内容に応じて調整可 (v1.4 は 340x210)
-2. **音響処理は改善歓迎**: `zansei_impl` / `freq_shift_mono/multi` / `safe_butter`(→`safe_butter_sos`) の**計算式を変えて良い**。条件は「劣化させない」のみ (ノイズ・エコー・リバーブ感が増えない、全体として劣化と感じない)。変更時は selftest に客観検証 (数値等価性 / spectral diff / peak shift) を組込、verdict=DEGRADED なら commit しない
+2. **音響処理は改善歓迎、ただし意味のある変更のみ**: `zansei_impl` / `freq_shift_mono/multi` / `safe_butter`(→`safe_butter_sos`) の**計算式を変えて良い**。条件は「劣化させない」+「**数値で差が出る (EQUIV のみは採用しない)**」。v1.4 の WAV 32bit float が foobar で v1.3 と同値だった事件を踏まえ、改善は**数値 + 主観の両方で確認**。selftest で `verdict=DEGRADED` または `verdict=EQUIV` のみなら commit しない (グローバル「意味のない変更禁止」ルール参照)
 3. **本家影響ゼロ**: `git remote` は `origin` (Rei3100/DSRE) のみ。**`upstream` remote を絶対に追加しない**。本家への PR/push は永久禁止
 4. **`run_hidden` は `CREATE_NO_WINDOW` 単独で使う** (STARTUPINFO は不要、yt-dlp GUI v17.2 と揃える)
 5. **Windows subprocess**: 必ず `creationflags=CREATE_NO_WINDOW`、コマンドプロンプトをポップさせない
 6. **INPUT_DIR / OUTPUT_DIR はハードコード維持** (個人ワークフローで固定、UI から変更させない方針)
 7. **新機能は plan → 承認 → 実装**。plan 冒頭に Claude Code 育成 9 項目テーブルを付けること
+8. **出力フォーマット FLAC 192/24 固定** (v1.5 確定)。WAV 32bit float / PCM_32 等への変更は**事前に「3 問チェック (利益/不足/重量)」全て yes** が必要
 
-## 音響処理改善ルール (v1.4 以降)
+## 音響処理改善ルール (v1.5 改訂)
 - ユーザーは最終の foobar2000 実聴確認のみ。**仮説・実装・客観検証は Claude が完結**
 - 変更時に selftest で必ず以下を計測:
   - 旧実装との数値差 (max_abs_diff, rms_diff)
   - スペクトル差 (bin あたりの dB 差)
   - 波形ピーク移動量
   - 3 負荷レベルでの determinism (同一入力で同一出力)
-- `verdict: EQUIV / IMPROVED / DEGRADED` を判定しログ出力。DEGRADED は CI で exit 1
+  - **psychoacoustic A/B (v1.5 追加)**: DR / spectral centroid / high-freq rolloff / spectral flatness の 4 指標を旧→新で比較
+- `verdict: EQUIV / IMPROVED / DEGRADED` を判定しログ出力。DEGRADED は CI で exit 1、EQUIV のみは warning
 - 指標ライブラリ (pyloudnorm 等) を**社内検証に使うのは自由**、出荷物に含めるかは都度判断
+
+## DSEE HX 系設計指針 (v1.5 以降、psychoacoustic 歓迎)
+
+DSRE の音響処理は **DSEE HX 思想**を継承する (グローバル CLAUDE.md「DSRE 方向性記事」節参照):
+
+- **段階的帯域拡張**: 低/中/高/超高域で別々に処理 (v1.5 で mid 3-8k / high 8-16k / ultra 16-24k に分割)
+- **adaptive processing**: 入力 hf_ratio (4kHz 以上 / 総エネルギー) を測定し処理強度を動的調整
+  - 圧縮音源 (hf_ratio < 0.05) → 強化 (layer 12/8/6)
+  - 中間 → 標準 (layer 8/6/4)
+  - 高域リッチ (hf_ratio ≥ 0.2) → 抑制 (layer 4/3/2)
+- **plausible な高域推定**: 既存 freq_shift (single-sideband) + 帯域内 spectral centroid 保持
+- **採用条件**: psychoacoustic A/B で IMPROVED 判定 (DR ±0.5dB 以内 + centroid 上昇 + rolloff 上昇)
+- **multiband_exciter / psychoacoustic_enhancer 系の改造**は自由。**「劣化しない」+「数値で差が出る」**を満たせば採用
 
 ## 定数中央集約 (ファイル冒頭)
 - `INPUT_DIR` / `OUTPUT_DIR`
